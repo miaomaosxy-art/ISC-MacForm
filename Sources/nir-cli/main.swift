@@ -1,4 +1,5 @@
 import Foundation
+import DLPSpec
 import HIDTransport
 import NIRDevice
 import NIRProtocol
@@ -53,9 +54,9 @@ struct NIRCLI {
               list   Enumerate USB HID devices with VID=0x0451 PID=0x4200
                      --all  also show every HID device on the system
               info   Open the first NIR-M-R2 and print Device Info
-              scan   Run a Simplex scan (PERFORM_SCAN 0x5A) and save wavelength/intensity CSV
+              scan   Complete scan → DLP Spectrum Library decode → scan.csv
                      --out PATH   output CSV (default: scan.csv)
-                     --raw        also save scan_wavelength.bin / scan_intensity.bin
+                     --raw        also keep scan_complete.bin (always written)
               interpret  Offline TI DLP Spectrum Library decode of serialized scan
                      Requires third_party/DLPSpectrumLibrary sources (TIDCC49/TIDCC50).
 
@@ -137,14 +138,24 @@ struct NIRCLI {
         let device = NIRDevice(debugLogging: debug)
         let sem = DispatchSemaphore(value: 0)
         var thrown: Error?
-        var artifacts: NIRDevice.ScanArtifacts?
+        var result: NIRDevice.CompleteScanResult?
+        var usbSerial: String?
+        var firmware: String?
 
         Task {
             do {
                 _ = try await device.connect()
                 if debug { await device.setDebugLogging(true) }
-                print("[NIR] Starting Simplex scan (PERFORM_SCAN flag=0x5A)…")
-                artifacts = try await device.runSimplexScan()
+                if let info = try? await device.getDeviceInfo() {
+                    usbSerial = info.serialNumber
+                    firmware = String(format: "%d.%d.%d",
+                                      (info.versions.tivaSW >> 16) & 0xFF,
+                                      (info.versions.tivaSW >> 8) & 0xFF,
+                                      info.versions.tivaSW & 0xFF)
+                }
+                print("NIR-M-R2 Scan")
+                print("")
+                result = try await device.runCompleteScan()
                 await device.disconnect()
             } catch {
                 thrown = error
@@ -154,73 +165,45 @@ struct NIRCLI {
         }
         sem.wait()
         if let thrown { throw thrown }
-        guard let artifacts else { throw NIRProtocolError.scanTimeout }
+        guard let result else { throw NIRProtocolError.scanTimeout }
 
-        print("Mode                : \(artifacts.mode)")
-        print("Estimated scan time : \(artifacts.estimatedScanTimeMS) ms")
-        print("Elapsed             : \(artifacts.elapsedMS) ms")
-        print("Wavelength raw      : \(artifacts.wavelengthRaw.count) bytes")
-        print("Intensity raw       : \(artifacts.intensityRaw.count) bytes")
-        print("Complete scan raw   : \(artifacts.completeScanRaw.count) bytes")
-        print("Interpret raw       : \(artifacts.interpretRaw.count) bytes")
+        // Always keep complete raw for diagnostics.
+        try Data(result.raw).write(to: URL(fileURLWithPath: "scan_complete.bin"))
 
-        if saveRaw || artifacts.spectrum == nil {
-            if !artifacts.wavelengthRaw.isEmpty {
-                try Data(artifacts.wavelengthRaw).write(to: URL(fileURLWithPath: "scan_wavelength.bin"))
-            }
-            if !artifacts.intensityRaw.isEmpty {
-                try Data(artifacts.intensityRaw).write(to: URL(fileURLWithPath: "scan_intensity.bin"))
-            }
-            if !artifacts.completeScanRaw.isEmpty {
-                try Data(artifacts.completeScanRaw).write(to: URL(fileURLWithPath: "scan_complete.bin"))
-            }
-            if !artifacts.interpretRaw.isEmpty {
-                try Data(artifacts.interpretRaw).write(to: URL(fileURLWithPath: "scan_interpret.bin"))
-            }
-            print("Saved raw           : scan_*.bin")
-        }
+        let spectrum = try DLPSpectrumDecoder.decode(result.raw)
 
-        guard let spectrum = artifacts.spectrum else {
-            print("")
-            print("NOTE: No host-side dlpspec / Simplex wavelength array on this firmware.")
-            print("      Active config is Hadamard (see scan_complete.bin \"Hadamard 1\").")
-            print("      scan_complete.bin  = NNO_FILE_SCAN_DATA (serialized, needs dlpspec_scan_interpret)")
-            print("      scan_interpret.bin = NNO_FILE_INTERPRET_DATA (device-side interpret, layout TBD)")
-            print("      Refusing to invent wavelength_nm. Use raw files or supply dlpspec.")
-            throw NIRProtocolError.spectrumParseFailed(
-                "raw saved (complete=\(artifacts.completeScanRaw.count)B interpret=\(artifacts.interpretRaw.count)B). Hadamard scan needs dlpspec for wavelengths."
-            )
-        }
-
-        let first = spectrum.points.first
-        let last = spectrum.points.last
-        print("Points              : \(spectrum.points.count)")
-        if let first, let last {
-            print(String(format: "Wavelength range    : %.3f – %.3f nm", first.wavelength, last.wavelength))
-        }
-        print(String(format: "Intensity range     : %d – %d",
-                     spectrum.points.map(\.intensity).min() ?? 0,
-                     spectrum.points.map(\.intensity).max() ?? 0))
-
-        var meta: [String: String] = [
-            "device": "NIR-M-R2",
-            "source": "simplex",
-            "estimated_scan_ms": "\(artifacts.estimatedScanTimeMS)",
-            "elapsed_ms": "\(artifacts.elapsedMS)",
-        ]
-        if let sn = artifacts.serialNumber { meta["serial"] = sn }
-
-        let csv = NIRDevice.csvString(from: spectrum, metadata: meta)
-        try csv.write(to: URL(fileURLWithPath: outPath), atomically: true, encoding: .utf8)
-        print("Saved CSV           : \(outPath)")
-
-        // Preview first/last few rows
+        print("Device")
+        print("  Serial       : \(spectrum.serialNumber ?? usbSerial ?? "-")")
+        print("  Configuration: \(spectrum.configurationName ?? "-")")
+        if let firmware { print("  Firmware     : \(firmware)") }
         print("")
-        print("wavelength_nm,intensity")
-        let preview = spectrum.points.prefix(3) + spectrum.points.suffix(3)
-        for p in preview {
-            print(String(format: "%.3f,%d", p.wavelength, p.intensity))
+        print("Scan")
+        print("  Points       : \(spectrum.points.count)")
+        if let a = spectrum.points.first, let b = spectrum.points.last {
+            print(String(format: "  Range        : %.3f – %.3f nm", a.wavelength, b.wavelength))
         }
+        if let t = spectrum.temperature {
+            print(String(format: "  Temperature  : %.2f °C", t))
+        }
+        if let h = spectrum.humidity {
+            print(String(format: "  Humidity     : %.2f %%", h))
+        }
+        if let pga = spectrum.pga {
+            print("  PGA          : \(pga)")
+        }
+        print(String(format: "  Raw size     : %d bytes", result.raw.count))
+        print(String(format: "  Elapsed      : %d ms", result.elapsedMS))
+        print("")
+        print("Saved")
+        print("  scan_complete.bin")
+        let csv = spectrum.csvString()
+        try csv.write(to: URL(fileURLWithPath: outPath), atomically: true, encoding: .utf8)
+        print("  \(outPath)")
+        if saveRaw {
+            print("  (raw already written)")
+        }
+        print("")
+        print("Result: PASS")
     }
 
     static func cmdInfo(debug: Bool) throws {

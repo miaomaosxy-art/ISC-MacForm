@@ -21,13 +21,18 @@ public struct Spectrum: Sendable, Equatable {
     public let points: [SpectrumPoint]
     public let temperature: Double?
     public let humidity: Double?
+    public let detectorTemperature: Double?
     public let serialNumber: String?
+    public let configurationName: String?
+    public let pga: Int?
     public let source: Source
 
     public enum Source: String, Sendable, Equatable {
         /// Device-interpreted Simplex files 0x0C / 0x0D (PERFORM_SCAN flag 0x5A).
         case simplex
-        /// Complete scan (flag 0x00) — raw only until dlpspec is available on macOS.
+        /// Complete scan decoded by official DLP Spectrum Library.
+        case dlpspec
+        /// Complete raw without decode (debug only).
         case completeRaw
     }
 
@@ -36,14 +41,20 @@ public struct Spectrum: Sendable, Equatable {
         points: [SpectrumPoint],
         temperature: Double? = nil,
         humidity: Double? = nil,
+        detectorTemperature: Double? = nil,
         serialNumber: String? = nil,
+        configurationName: String? = nil,
+        pga: Int? = nil,
         source: Source
     ) {
         self.timestamp = timestamp
         self.points = points
         self.temperature = temperature
         self.humidity = humidity
+        self.detectorTemperature = detectorTemperature
         self.serialNumber = serialNumber
+        self.configurationName = configurationName
+        self.pga = pga
         self.source = source
     }
 }
@@ -271,6 +282,34 @@ public actor NIRDevice {
     /// Scan pipeline. Prefers Simplex (0x5A → FILE 0x0C/0x0D). On this firmware
     /// those files have been empty; then falls back to Complete (0x00) +
     /// NNO_FILE_INTERPRET_DATA (0x09) after NNO_CMD_START_SCAN_INTERPRET.
+    /// Full complete-scan pipeline (primary path):
+    /// estimated time → PERFORM_SCAN(0x00) → poll → FILE NNO_FILE_SCAN_DATA.
+    /// Returns serialized scan blob for `DLPSpectrumDecoder.decode`.
+    public struct CompleteScanResult: Sendable {
+        public var raw: [UInt8]
+        public var estimatedScanTimeMS: UInt32
+        public var elapsedMS: Int
+        public var serialNumber: String?
+    }
+
+    public func runCompleteScan(timeoutMS: Int? = nil) async throws -> CompleteScanResult {
+        let serial = try? proto.readSerialNumber()
+        let estimated = (try? getEstimatedScanTimeViaCommand()) ?? 3000
+        let budget = timeoutMS ?? Int(estimated) + 5000
+
+        let t0 = Date()
+        try startScan(flag: .complete)
+        try await waitScanComplete(timeoutMS: budget)
+        let raw = try proto.readFile(fileType: .scanData)
+        return CompleteScanResult(
+            raw: raw,
+            estimatedScanTimeMS: estimated,
+            elapsedMS: Int(Date().timeIntervalSince(t0) * 1000),
+            serialNumber: serial
+        )
+    }
+
+    /// Simplex path (debug / compatibility). Primary path is `runCompleteScan` + DLPSpectrumDecoder.
     public func runSimplexScan(timeoutMS: Int? = nil) async throws -> ScanArtifacts {
         let serial = try? proto.readSerialNumber()
         let estimated = (try? getEstimatedScanTimeViaCommand()) ?? 3000
@@ -343,18 +382,27 @@ public actor NIRDevice {
 
     public static func csvString(from spectrum: Spectrum, metadata: [String: String] = [:]) -> String {
         var lines: [String] = []
+        var meta = metadata
+        if let serialNumber = spectrum.serialNumber { meta["serial"] = serialNumber }
+        if let configurationName = spectrum.configurationName { meta["config"] = configurationName }
+        if let temperature = spectrum.temperature {
+            meta["temperature_c"] = String(format: "%.2f", temperature)
+        }
+        if let detectorTemperature = spectrum.detectorTemperature {
+            meta["detector_temperature_c"] = String(format: "%.2f", detectorTemperature)
+        }
+        if let humidity = spectrum.humidity {
+            meta["humidity_percent"] = String(format: "%.2f", humidity)
+        }
+        if let pga = spectrum.pga { meta["pga"] = "\(pga)" }
+        meta["points"] = "\(spectrum.points.count)"
+        meta["timestamp"] = ISO8601DateFormatter().string(from: spectrum.timestamp)
+        for key in meta.keys.sorted() {
+            lines.append("# \(key)=\(meta[key] ?? "")")
+        }
         lines.append("wavelength_nm,intensity")
         for p in spectrum.points {
-            // Wavelength with 3 decimal places (nm); intensity as integer.
             lines.append(String(format: "%.3f,%d", p.wavelength, p.intensity))
-        }
-        // Optional metadata as comment lines (ignored by most CSV readers).
-        if !metadata.isEmpty {
-            var meta: [String] = []
-            for key in metadata.keys.sorted() {
-                meta.append("# \(key)=\(metadata[key] ?? "")")
-            }
-            lines.insert(contentsOf: meta, at: 0)
         }
         return lines.joined(separator: "\n") + "\n"
     }

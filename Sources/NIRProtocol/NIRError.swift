@@ -5,6 +5,7 @@ import Foundation
 public enum NIRProtocolError: Error, Equatable, CustomStringConvertible {
     case deviceNotFound
     case deviceOpenFailed(String)
+    case deviceDisconnected
     case usbWriteFailed(String)
     case usbReadTimeout
     case invalidPacket(String)
@@ -23,6 +24,8 @@ public enum NIRProtocolError: Error, Equatable, CustomStringConvertible {
             return "DeviceNotFound: NIR-M-R2 (VID 0x0451 / PID 0x4200) not found"
         case .deviceOpenFailed(let detail):
             return "DeviceOpenFailed: \(detail)"
+        case .deviceDisconnected:
+            return "DeviceDisconnected"
         case .usbWriteFailed(let detail):
             return "USBWriteFailed: \(detail)"
         case .usbReadTimeout:
@@ -55,6 +58,8 @@ public enum NIRProtocolError: Error, Equatable, CustomStringConvertible {
             return "未找到 NIR-M-R2 光谱仪，请检查 USB 连接与电源开关。"
         case .deviceOpenFailed:
             return "打开设备失败，请重新插拔 USB 后再试。"
+        case .deviceDisconnected:
+            return "设备已断开连接。"
         case .usbWriteFailed:
             return "USB 发送失败。"
         case .usbReadTimeout:

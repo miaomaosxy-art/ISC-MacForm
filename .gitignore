@@ -5,6 +5,8 @@ DerivedData/
 .DS_Store
 scan.csv
 scan.bin
+scan_*.csv
+scan_*.bin
 *.raw
 
 # TI DLP Spectrum Library (export-controlled — do not commit)
