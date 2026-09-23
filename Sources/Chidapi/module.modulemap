@@ -1,0 +1,5 @@
+module Chidapi [system] {
+    header "include/chidapi_shim.h"
+    link "hidapi"
+    export *
+}
