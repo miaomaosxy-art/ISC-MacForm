@@ -1,6 +1,7 @@
 import CDLPSpec
 import Foundation
 import NIRDevice
+import NIRProtocol
 
 public enum SpectrumDecodeError: Error, Equatable, CustomStringConvertible {
     case libraryUnavailable(String)
@@ -41,7 +42,7 @@ public enum DLPSpectrumDecoder {
         String(cString: nir_dlpspec_version_string())
     }
 
-    public static func decode(_ raw: [UInt8]) throws -> Spectrum {
+    public static func decode(_ raw: [UInt8], keepRaw: Bool = false) throws -> Spectrum {
         guard !raw.isEmpty else {
             throw SpectrumDecodeError.invalidSpectrum("empty raw scan buffer")
         }
@@ -50,6 +51,8 @@ public enum DLPSpectrumDecoder {
                 "Build with third_party/DLPSpectrumLibrary (see third_party/THIRD_PARTY.md)"
             )
         }
+
+        DebugLog.dlp("decode \(raw.count) B via dlpspec \(version)")
 
         var out = NIRDecodedSpectrum()
         let rc = raw.withUnsafeBufferPointer { buf -> Int32 in
@@ -62,6 +65,7 @@ public enum DLPSpectrumDecoder {
             let msg = withUnsafePointer(to: out.message) {
                 $0.withMemoryRebound(to: CChar.self, capacity: 256) { String(cString: $0) }
             }
+            DebugLog.dlp("decode FAIL rc=\(out.return_code): \(msg)")
             throw SpectrumDecodeError.interpretFailed(returnCode: out.return_code, message: msg)
         }
 
@@ -78,6 +82,26 @@ public enum DLPSpectrumDecoder {
         let serial = withUnsafePointer(to: out.serial_number) {
             $0.withMemoryRebound(to: CChar.self, capacity: 8) { String(cString: $0) }
         }
+        let cfgName = withUnsafePointer(to: out.cfg_config_name) {
+            $0.withMemoryRebound(to: CChar.self, capacity: 40) { String(cString: $0) }
+        }
+
+        let typeCode = out.cfg_scan_type >= 0 ? Int(out.cfg_scan_type) : nil
+        let config = ScanConfigInfo(
+            name: {
+                if !scanName.isEmpty { return scanName }
+                if !cfgName.isEmpty { return cfgName }
+                return nil
+            }(),
+            scanTypeCode: typeCode,
+            configIndex: out.cfg_scan_config_index != 0 ? Int(out.cfg_scan_config_index) : nil,
+            wavelengthStartNM: out.cfg_wavelength_start_nm != 0 ? Int(out.cfg_wavelength_start_nm) : nil,
+            wavelengthEndNM: out.cfg_wavelength_end_nm != 0 ? Int(out.cfg_wavelength_end_nm) : nil,
+            widthPx: out.cfg_width_px != 0xFF ? Int(out.cfg_width_px) : nil,
+            numPatterns: out.cfg_num_patterns != 0 ? Int(out.cfg_num_patterns) : nil,
+            numRepeats: out.cfg_num_repeats != 0 ? Int(out.cfg_num_repeats) : nil,
+            numSections: out.cfg_num_sections != 0 ? Int(out.cfg_num_sections) : nil
+        )
 
         let spectrum = Spectrum(
             timestamp: Date(),
@@ -86,11 +110,14 @@ public enum DLPSpectrumDecoder {
             humidity: out.humidity,
             detectorTemperature: out.detector_temperature,
             serialNumber: serial.isEmpty ? nil : serial,
-            configurationName: scanName.isEmpty ? nil : scanName,
+            configurationName: scanName.isEmpty ? (cfgName.isEmpty ? nil : cfgName) : scanName,
             pga: Int(out.pga),
-            source: .dlpspec
+            source: .dlpspec,
+            raw: keepRaw ? raw : nil,
+            config: config
         )
         try spectrum.validateForNIR()
+        DebugLog.dlp("decode PASS, \(n) points")
         return spectrum
     }
 }
@@ -147,6 +174,13 @@ extension Spectrum {
         if let pga { lines.append("# pga=\(pga)") }
         lines.append("# points=\(points.count)")
         lines.append("# timestamp=\(ISO8601DateFormatter().string(from: timestamp))")
+        if let config {
+            if let type = config.scanTypeName { lines.append("# scan_type=\(type)") }
+            if let idx = config.configIndex { lines.append("# config_index=\(idx)") }
+            if let w = config.widthPx { lines.append("# width_px=\(w)") }
+            if let r = config.numRepeats { lines.append("# num_repeats=\(r)") }
+            if let p = config.numPatterns { lines.append("# num_patterns=\(p)") }
+        }
         lines.append("wavelength_nm,intensity")
         for p in points {
             lines.append(String(format: "%.3f,%d", p.wavelength, p.intensity))

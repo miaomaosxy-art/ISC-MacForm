@@ -69,6 +69,11 @@ let package = Package(
         .executableTarget(
             name: "NIRMacApp",
             dependencies: ["NIRDevice", "NIRProtocol", "HIDTransport", "DLPSpec"]
+        ),
+        .testTarget(
+            name: "NIRMacTests",
+            dependencies: ["DLPSpec", "NIRDevice", "NIRProtocol", "HIDTransport"],
+            exclude: ["Fixtures"]
         )
     ]
 )

@@ -153,9 +153,13 @@ public final class NIRProtocolClient: @unchecked Sendable {
         timeoutMS: Int = NIRExchange.defaultTimeoutMS
     ) throws -> [UInt8] {
         let expected = Int(try readFileSize(fileType: fileType))
-        transport.log("[NIR] Reading file type=0x\(String(fileType.rawValue, radix: 16, uppercase: true)) size=\(expected) bytes")
+        transport.log("[FILE] expected \(expected) bytes type=0x\(String(fileType.rawValue, radix: 16, uppercase: true))")
+        DebugLog.file("expected \(expected) bytes type=0x\(String(fileType.rawValue, radix: 16, uppercase: true))")
 
-        guard expected > 0 else { return [] }
+        guard expected > 0 else {
+            DebugLog.file("received 0 bytes (empty file)")
+            return []
+        }
 
         var body = [UInt8]()
         body.reserveCapacity(expected)
@@ -165,17 +169,18 @@ public final class NIRProtocolClient: @unchecked Sendable {
         while body.count < expected && Date() < deadline {
             let chunk = try readOneDataChunk(deadline: deadline)
             if chunk.isEmpty {
-                transport.log("[NIR] WARN: empty GET_DATA chunk at \(body.count)/\(expected)")
+                transport.log("[FILE] WARN: empty GET_DATA chunk at \(body.count)/\(expected)")
+                DebugLog.file("WARN empty GET_DATA chunk at \(body.count)/\(expected)")
                 continue
             }
             body.append(contentsOf: chunk)
         }
 
         guard body.count >= expected else {
-            throw NIRProtocolError.invalidScanData(
-                "file read incomplete: got \(body.count)/\(expected)"
-            )
+            DebugLog.file("truncated: got \(body.count)/\(expected)")
+            throw NIRProtocolError.fileTruncated(expected: expected, actual: body.count)
         }
+        DebugLog.file("received \(body.count) bytes")
         return Array(body.prefix(expected))
     }
 

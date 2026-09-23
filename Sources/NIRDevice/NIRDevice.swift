@@ -26,6 +26,10 @@ public struct Spectrum: Sendable, Equatable {
     public let configurationName: String?
     public let pga: Int?
     public let source: Source
+    /// Complete serialized scan blob (for optional raw export). nil for averages.
+    public let raw: [UInt8]?
+    /// Fields present in the serialized scan config / protocol. Not invented.
+    public let config: ScanConfigInfo?
 
     public enum Source: String, Sendable, Equatable {
         /// Device-interpreted Simplex files 0x0C / 0x0D (PERFORM_SCAN flag 0x5A).
@@ -45,7 +49,9 @@ public struct Spectrum: Sendable, Equatable {
         serialNumber: String? = nil,
         configurationName: String? = nil,
         pga: Int? = nil,
-        source: Source
+        source: Source,
+        raw: [UInt8]? = nil,
+        config: ScanConfigInfo? = nil
     ) {
         self.timestamp = timestamp
         self.points = points
@@ -56,6 +62,13 @@ public struct Spectrum: Sendable, Equatable {
         self.configurationName = configurationName
         self.pga = pga
         self.source = source
+        self.raw = raw
+        self.config = config
+    }
+
+    public var wavelengthRange: (min: Double, max: Double)? {
+        guard let first = points.first, let last = points.last else { return nil }
+        return (min(first.wavelength, last.wavelength), max(first.wavelength, last.wavelength))
     }
 }
 

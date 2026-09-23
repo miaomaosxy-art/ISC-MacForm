@@ -17,6 +17,8 @@ public enum NIRProtocolError: Error, Equatable, CustomStringConvertible {
     case spectrumParseFailed(String)
     case invalidPayloadLength(expected: Int, actual: Int)
     case unexpectedCommand(expected: UInt8, got: UInt8)
+    case fileTruncated(expected: Int, actual: Int)
+    case saveFailed(String)
 
     public var description: String {
         switch self {
@@ -48,6 +50,10 @@ public enum NIRProtocolError: Error, Equatable, CustomStringConvertible {
             return "InvalidPacket: payload length expected \(expected), got \(actual)"
         case .unexpectedCommand(let expected, let got):
             return "InvalidPacket: expected cmd 0x\(String(expected, radix: 16)), got 0x\(String(got, radix: 16))"
+        case .fileTruncated(let expected, let actual):
+            return "FILE_GET_DATA truncated: expected \(expected), got \(actual)"
+        case .saveFailed(let detail):
+            return "SaveFailed: \(detail)"
         }
     }
 
@@ -72,8 +78,10 @@ public enum NIRProtocolError: Error, Equatable, CustomStringConvertible {
             return "设备返回错误状态。"
         case .scanTimeout:
             return "扫描超时。"
-        case .invalidScanData, .spectrumParseFailed:
+        case .invalidScanData, .spectrumParseFailed, .fileTruncated:
             return "扫描数据无效。"
+        case .saveFailed:
+            return "保存失败。"
         }
     }
 }

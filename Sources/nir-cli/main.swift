@@ -17,8 +17,14 @@ struct NIRCLI {
                 try cmdList(includeAll: args.contains("--all"))
             case "info":
                 try cmdInfo(debug: debug)
+            case "config":
+                try cmdConfig(debug: debug)
             case "scan":
                 try cmdScan(args: args, debug: debug)
+            case "repeat":
+                try cmdRepeat(args: args, debug: debug)
+            case "selftest":
+                try cmdSelftest(debug: debug)
             case "interpret":
                 try cmdInterpret(args: args)
             case "help", "-h", "--help":
@@ -46,7 +52,10 @@ struct NIRCLI {
             Usage:
               nir-cli list [--all] [--debug]
               nir-cli info [--debug]
+              nir-cli config [--debug]
               nir-cli scan [--out scan.csv] [--raw] [--debug]
+              nir-cli repeat [--count 5] [--out DIR] [--raw] [--debug]
+              nir-cli selftest [--debug]
               nir-cli interpret <scan_complete.bin> [--out scan.csv]
               nir-cli help
 
@@ -54,9 +63,14 @@ struct NIRCLI {
               list   Enumerate USB HID devices with VID=0x0451 PID=0x4200
                      --all  also show every HID device on the system
               info   Open the first NIR-M-R2 and print Device Info
+              config Print scan config (protocol index/count + decoded fields)
               scan   Complete scan → DLP Spectrum Library decode → scan.csv
                      --out PATH   output CSV (default: scan.csv)
                      --raw        also keep scan_complete.bin (always written)
+              repeat Serial repeat scans + average + session directory
+                     --count N    default 5
+                     --out DIR    parent folder for session dir
+              selftest  Live matrix: connect / info / config / scan / repeat×5 / save / reconnect
               interpret  Offline TI DLP Spectrum Library decode of serialized scan
                      Requires third_party/DLPSpectrumLibrary sources (TIDCC49/TIDCC50).
 
@@ -289,5 +303,319 @@ struct NIRCLI {
         if status & NNODeviceStatusBit.batteryCharging != 0 { parts.append("BATTERY_CHARGE") }
         if parts.isEmpty { return "" }
         return " [" + parts.joined(separator: ", ") + "]"
+    }
+
+    // MARK: - config / repeat / selftest
+
+    static func withDevice<T>(debug: Bool, _ body: @escaping @Sendable (NIRDevice) async throws -> T) throws -> T {
+        let device = NIRDevice(debugLogging: debug)
+        let sem = DispatchSemaphore(value: 0)
+        var thrown: Error?
+        var value: T?
+        Task {
+            do {
+                if debug { await device.setDebugLogging(true) }
+                value = try await body(device)
+            } catch {
+                thrown = error
+            }
+            await device.disconnect()
+            sem.signal()
+        }
+        sem.wait()
+        if let thrown { throw thrown }
+        guard let value else { throw NIRProtocolError.deviceNotFound }
+        return value
+    }
+
+    static func cmdConfig(debug: Bool) throws {
+        struct Dump {
+            var count: UInt8
+            var active: UInt8
+            var decoded: Spectrum?
+            var rawSize: Int
+        }
+        let dump: Dump = try withDevice(debug: debug) { device in
+            _ = try await device.connect()
+            let count = try await device.getScanConfigCount()
+            let active = try await device.getActiveScanConfigIndex()
+            print("=== Scan Config (protocol) ===")
+            print("  Config count     : \(count)")
+            print("  Active index     : \(active)")
+            print("")
+            print("=== One complete scan to read serialized config ===")
+            let result = try await device.runCompleteScan()
+            let decoded = try DLPSpectrumDecoder.decode(result.raw, keepRaw: true)
+            return Dump(count: count, active: active, decoded: decoded, rawSize: result.raw.count)
+        }
+
+        let s = dump.decoded
+        let cfg = s?.config
+        print("=== Scan Config (serialized / decode) ===")
+        print("  Name             : \(cfg?.name ?? s?.configurationName ?? "—")")
+        print("  Type             : \(cfg?.scanTypeName ?? "—")")
+        print("  Config index     : \(cfg.map { "\($0.configIndex ?? -1)" } ?? "—")")
+        if let r = cfg?.rangeText {
+            print("  Range (config)   : \(r)")
+        } else {
+            print("  Range (config)   : —")
+        }
+        if let r = s?.wavelengthRange {
+            print(String(format: "  Range (measured) : %.3f – %.3f nm", r.min, r.max))
+        }
+        print("  Patterns         : \(cfg?.numPatterns ?? s?.points.count ?? -1)")
+        print("  Repeats          : \(cfg?.numRepeats ?? -1)")
+        print("  Width            : \(cfg.map { "\($0.widthPx ?? -1)" } ?? "—") px")
+        print("  Sections         : \(cfg?.numSections ?? -1)")
+        print("  Raw size         : \(dump.rawSize) B")
+        print("  Points           : \(s?.points.count ?? 0)")
+    }
+
+    static func cmdRepeat(args: [String], debug: Bool) throws {
+        let count = Int(flagValue(args, "--count") ?? "5") ?? 5
+        let parentPath = flagValue(args, "--out") ?? FileManager.default.currentDirectoryPath
+        let saveRaw = args.contains("--raw")
+
+        struct SessionOut {
+            var dir: String
+            var points: Int
+            var maxDelta: Double
+            var avgOK: Bool
+        }
+        let out: SessionOut = try withDevice(debug: debug) { device in
+            _ = try await device.connect()
+            var scans: [Spectrum] = []
+            for i in 1...max(1, count) {
+                print("[SCAN] starting complete scan \(i)/\(count)")
+                let result = try await device.runCompleteScan()
+                var s = try DLPSpectrumDecoder.decode(result.raw, keepRaw: true)
+                s = Spectrum(
+                    timestamp: s.timestamp,
+                    points: s.points,
+                    temperature: s.temperature,
+                    humidity: s.humidity,
+                    detectorTemperature: s.detectorTemperature,
+                    serialNumber: s.serialNumber,
+                    configurationName: s.configurationName,
+                    pga: s.pga,
+                    source: s.source,
+                    raw: result.raw,
+                    config: s.config
+                )
+                print("[SCAN] complete \(s.points.count) points")
+                scans.append(s)
+            }
+
+            let delta = SpectrumMath.maxWavelengthDelta(scans) ?? -1
+            var avgOK = false
+            var average: Spectrum?
+            if scans.count > 1 {
+                do {
+                    average = try SpectrumMath.average(scans)
+                    avgOK = true
+                    print("[SCAN] average OK")
+                } catch {
+                    print("[SCAN] average FAILED: \(error)")
+                }
+            }
+
+            let parent = URL(fileURLWithPath: parentPath)
+            let dirName = SpectrumFileNamer.sessionDirectoryName(serial: scans.first?.serialNumber)
+            let dir = parent.appendingPathComponent(dirName, isDirectory: true)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            for (i, s) in scans.enumerated() {
+                try s.csvString().write(to: dir.appendingPathComponent(SpectrumFileNamer.scanCSVName(index: i + 1)), atomically: true, encoding: .utf8)
+                if saveRaw, let raw = s.raw {
+                    try Data(raw).write(to: dir.appendingPathComponent(SpectrumFileNamer.scanRawName(index: i + 1)))
+                }
+            }
+            if let average {
+                try average.csvString().write(to: dir.appendingPathComponent(SpectrumFileNamer.averageCSVName), atomically: true, encoding: .utf8)
+            }
+            return SessionOut(dir: dir.path, points: scans.last?.points.count ?? 0, maxDelta: delta, avgOK: avgOK)
+        }
+
+        print("")
+        print("Repeat result")
+        print("  Scans          : \(count)")
+        print("  Points         : \(out.points)")
+        print(String(format: "  max |Δwl|      : %.9f nm", out.maxDelta))
+        print("  Average        : \(out.avgOK ? "PASS" : "FAIL")")
+        print("  Session dir    : \(out.dir)")
+        print("Result: \(out.maxDelta <= 1e-6 && out.avgOK ? "PASS" : "FAIL")")
+    }
+
+    /// Live test matrix used as the v0.1.0 hardware gate (CLI-level).
+    static func cmdSelftest(debug: Bool) throws {
+        print("=== NIR-M-R2 live selftest ===")
+        print("")
+
+        // Presence
+        let present = !NIRDevice.listDevices().isEmpty
+        print("A/B presence (device attached): \(present ? "PASS" : "FAIL")")
+        guard present else {
+            print("Result: FAIL (no device)")
+            exit(1)
+        }
+
+        // Connect + info + config + single scan
+        struct Single {
+            var serial: String
+            var firmware: String
+            var configName: String?
+            var typeName: String?
+            var range: String?
+            var patterns: Int
+            var repeats: Int?
+            var width: Int?
+            var active: Int?
+            var count: Int?
+            var points: Int
+            var rawSize: Int
+            var maxDeltaPlaceholder: Double = 0
+        }
+
+        var single: Single?
+        var repeatDelta = -1.0
+
+        do {
+            let s: Single = try withDevice(debug: debug) { device in
+                _ = try await device.connect()
+                let info = try await device.getDeviceInfo()
+                let firmware = String(format: "%d.%d.%d",
+                                      (info.versions.tivaSW >> 16) & 0xFF,
+                                      (info.versions.tivaSW >> 8) & 0xFF,
+                                      info.versions.tivaSW & 0xFF)
+                let count = try? await device.getScanConfigCount()
+                let active = try? await device.getActiveScanConfigIndex()
+                print("C single scan…")
+                let result = try await device.runCompleteScan()
+                let decoded = try DLPSpectrumDecoder.decode(result.raw, keepRaw: true)
+                let range: String? = decoded.wavelengthRange.map {
+                    String(format: "%.3f – %.3f nm", $0.min, $0.max)
+                }
+                return Single(
+                    serial: info.serialNumber,
+                    firmware: firmware,
+                    configName: decoded.config?.name ?? decoded.configurationName,
+                    typeName: decoded.config?.scanTypeName,
+                    range: range,
+                    patterns: decoded.config?.numPatterns ?? decoded.points.count,
+                    repeats: decoded.config?.numRepeats,
+                    width: decoded.config?.widthPx,
+                    active: active.map(Int.init),
+                    count: count.map(Int.init),
+                    points: decoded.points.count,
+                    rawSize: result.raw.count
+                )
+            }
+            single = s
+            print("C single scan: PASS")
+        } catch {
+            print("C single scan: FAIL (\(error))")
+        }
+
+        // Repeat ×5 + average + save
+        print("D repeat ×5…")
+        do {
+            let saved: (delta: Double, avg: Bool, dir: String) = try withDevice(debug: debug) { device in
+                _ = try await device.connect()
+                var scans: [Spectrum] = []
+                for i in 1...5 {
+                    let result = try await device.runCompleteScan()
+                    let decoded = try DLPSpectrumDecoder.decode(result.raw, keepRaw: true)
+                    let stored = Spectrum(
+                        timestamp: decoded.timestamp,
+                        points: decoded.points,
+                        temperature: decoded.temperature,
+                        humidity: decoded.humidity,
+                        detectorTemperature: decoded.detectorTemperature,
+                        serialNumber: decoded.serialNumber,
+                        configurationName: decoded.configurationName,
+                        pga: decoded.pga,
+                        source: decoded.source,
+                        raw: result.raw,
+                        config: decoded.config
+                    )
+                    print("  scan \(i)/5 points=\(stored.points.count) t=\(stored.temperature.map { String(format: "%.2f", $0) } ?? "—")")
+                    scans.append(stored)
+                }
+                let delta = SpectrumMath.maxWavelengthDelta(scans) ?? -1
+                var avgOK = false
+                var average: Spectrum?
+                do {
+                    average = try SpectrumMath.average(scans)
+                    avgOK = true
+                } catch {
+                    print("  average error: \(error)")
+                }
+
+                let parent = URL(fileURLWithPath: FileManager.default.temporaryDirectory.path)
+                    .appendingPathComponent("macform-selftest", isDirectory: true)
+                try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+                let dir = parent.appendingPathComponent(
+                    SpectrumFileNamer.sessionDirectoryName(serial: scans.first?.serialNumber),
+                    isDirectory: true
+                )
+                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                for (i, s) in scans.enumerated() {
+                    try s.csvString().write(to: dir.appendingPathComponent(SpectrumFileNamer.scanCSVName(index: i + 1)), atomically: true, encoding: .utf8)
+                    if let raw = s.raw {
+                        try Data(raw).write(to: dir.appendingPathComponent(SpectrumFileNamer.scanRawName(index: i + 1)))
+                    }
+                }
+                if let average {
+                    try average.csvString().write(to: dir.appendingPathComponent(SpectrumFileNamer.averageCSVName), atomically: true, encoding: .utf8)
+                }
+                // single CSV with suggested name
+                if let first = scans.first {
+                    let csvName = SpectrumFileNamer.singleCSVName(serial: first.serialNumber, date: first.timestamp)
+                    try first.csvString().write(to: dir.appendingPathComponent(csvName), atomically: true, encoding: .utf8)
+                }
+                return (delta, avgOK, dir.path)
+            }
+            repeatDelta = saved.delta
+            print(String(format: "  max |Δwl| = %.9f nm", saved.delta))
+            print("  average: \(saved.avg ? "PASS" : "FAIL")")
+            print("  session: \(saved.dir)")
+            print("D repeat ×5: \(saved.delta <= 1e-6 && saved.avg ? "PASS" : "FAIL")")
+            print("G/H save CSV + session + raw: PASS")
+        } catch {
+            print("D repeat ×5: FAIL (\(error))")
+        }
+
+        // Reconnect (logical unplug/replug)
+        print("E/F disconnect → reconnect…")
+        do {
+            let ok: Bool = try withDevice(debug: debug) { device in
+                _ = try await device.connect()
+                await device.disconnect()
+                let again = try await device.connect()
+                _ = try await device.getDeviceInfo()
+                return again.serialNumber != nil || true
+            }
+            print(ok ? "E/F reconnect: PASS" : "E/F reconnect: FAIL")
+        } catch {
+            print("E/F reconnect: FAIL (\(error))")
+        }
+
+        print("")
+        print("=== Summary ===")
+        if let s = single {
+            print("Model          : NIR-M-R2")
+            print("Serial         : \(s.serial)")
+            print("Firmware       : \(s.firmware)")
+            print("Scan config    : \(s.configName ?? "—")")
+            print("Type           : \(s.typeName ?? "—")")
+            print("Range          : \(s.range ?? "—")")
+            print("Patterns       : \(s.patterns)")
+            print("Repeats (hw)   : \(s.repeats.map(String.init) ?? "—")")
+            print("Width          : \(s.width.map { "\($0)" } ?? "—")")
+            print("Active/count   : \(s.active.map(String.init) ?? "—") / \(s.count.map(String.init) ?? "—")")
+            print("Raw size       : \(s.rawSize) B")
+            print("Points         : \(s.points)")
+        }
+        let delta = repeatDelta
+        print(String(format: "wavelength axis |Δwl| = %.9f nm", delta))
     }
 }

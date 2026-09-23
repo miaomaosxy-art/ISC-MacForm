@@ -202,15 +202,19 @@ public final class HIDTransport: @unchecked Sendable {
     // MARK: - Logging
 
     public func log(_ message: String) {
-        if isDebugLoggingEnabled {
-            print(message)
+        if isDebugLoggingEnabled || DebugLog.isEnabled {
+            DebugLog.usb(message)
+            if !DebugLog.isEnabled { print(message) }
         }
     }
 
     public func logHex(prefix: String, data: [UInt8]) {
-        guard isDebugLoggingEnabled else { return }
-        let hex = data.map { String(format: "%02X", $0) }.joined(separator: " ")
-        print("\(prefix):\n\(hex)")
+        guard isDebugLoggingEnabled || DebugLog.isEnabled else { return }
+        DebugLog.hex("USB", prefix: prefix, data: data)
+        if !DebugLog.isEnabled {
+            let hex = data.map { String(format: "%02X", $0) }.joined(separator: " ")
+            print("\(prefix):\n\(hex)")
+        }
     }
 }
 

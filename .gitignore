@@ -9,6 +9,9 @@ scan_*.csv
 scan_*.bin
 *.raw
 
+# Keep golden test fixtures (live device capture, not vendor IP)
+!Tests/NIRMacTests/Fixtures/**
+
 # TI DLP Spectrum Library (export-controlled — do not commit)
 third_party/DLPSpectrumLibrary/
 third_party/vendor-objects/

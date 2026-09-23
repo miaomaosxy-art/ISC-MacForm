@@ -24,6 +24,18 @@ typedef struct {
     uint8_t  year, month, day, hour, minute, second;
     int32_t  return_code;     /* DLPSPEC_ERR_CODE */
     char     message[256];
+
+    /* Serialized scan config fields from scanResults.cfg (slewScanConfig).
+       Only values present in the official structure; -1 / 0xFF when unknown. */
+    int16_t  cfg_scan_type;          /* SCAN_TYPES: 0 Col, 1 Had, 2 Slew */
+    uint16_t cfg_scan_config_index;
+    char     cfg_config_name[40];
+    uint16_t cfg_wavelength_start_nm;
+    uint16_t cfg_wavelength_end_nm;
+    uint8_t  cfg_width_px;
+    uint16_t cfg_num_patterns;
+    uint16_t cfg_num_repeats;
+    uint8_t  cfg_num_sections;
 } NIRDecodedSpectrum;
 
 /* Returns 0 on success (DLPSPEC_PASS). */
