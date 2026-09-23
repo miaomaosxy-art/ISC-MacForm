@@ -173,6 +173,10 @@ public actor NIRDevice {
     // MARK: - Scan primitives (Phase 2+)
 
     public func getEstimatedScanTimeMS() throws -> UInt32 {
+        try getEstimatedScanTimeViaCommand()
+    }
+
+    func getEstimatedScanTimeViaCommand() throws -> UInt32 {
         let resp = try proto.sendCommand(
             group: NNOGroup.system.rawValue,
             command: NNOSystemCommand.readScanTime
@@ -249,6 +253,83 @@ public actor NIRDevice {
         return try Self.parseSimplex(wavelengthRaw: wlRaw, intensityRaw: inRaw)
     }
 
+    /// Full Simplex scan pipeline (Command Description §1.4.1 + UART §3.3.6):
+    /// estimated time → PERFORM_SCAN(0x5A) → poll status → FILE 0x0C/0x0D → parse.
+    /// On parse failure, raw bytes are still returned so they can be saved as `.bin`.
+    public struct ScanArtifacts: Sendable {
+        public var spectrum: Spectrum?
+        public var wavelengthRaw: [UInt8]
+        public var intensityRaw: [UInt8]
+        public var completeScanRaw: [UInt8]
+        public var interpretRaw: [UInt8]
+        public var estimatedScanTimeMS: UInt32
+        public var elapsedMS: Int
+        public var serialNumber: String?
+        public var mode: String
+    }
+
+    /// Scan pipeline. Prefers Simplex (0x5A → FILE 0x0C/0x0D). On this firmware
+    /// those files have been empty; then falls back to Complete (0x00) +
+    /// NNO_FILE_INTERPRET_DATA (0x09) after NNO_CMD_START_SCAN_INTERPRET.
+    public func runSimplexScan(timeoutMS: Int? = nil) async throws -> ScanArtifacts {
+        let serial = try? proto.readSerialNumber()
+        let estimated = (try? getEstimatedScanTimeViaCommand()) ?? 3000
+        let budget = timeoutMS ?? Int(estimated) + 5000
+
+        // --- Simplex path ---
+        let t0 = Date()
+        try startScan(flag: .simplex)
+        try await waitScanComplete(timeoutMS: budget)
+        let wlRaw = (try? proto.readFile(fileType: .simplexScanWavelength)) ?? []
+        let inRaw = (try? proto.readFile(fileType: .simplexScanIntensity)) ?? []
+        if !wlRaw.isEmpty, !inRaw.isEmpty,
+           let s = try? Self.parseSimplex(wavelengthRaw: wlRaw, intensityRaw: inRaw) {
+            return ScanArtifacts(
+                spectrum: Spectrum(points: s.points, serialNumber: serial, source: .simplex),
+                wavelengthRaw: wlRaw,
+                intensityRaw: inRaw,
+                completeScanRaw: [],
+                interpretRaw: [],
+                estimatedScanTimeMS: estimated,
+                elapsedMS: Int(Date().timeIntervalSince(t0) * 1000),
+                serialNumber: serial,
+                mode: "simplex"
+            )
+        }
+
+        // --- Complete + Tiva interpret fallback ---
+        try startScan(flag: .complete)
+        try await waitScanComplete(timeoutMS: budget)
+        let complete = (try? proto.readFile(fileType: .scanData)) ?? []
+
+        // Device-side interpretation (Command Description §1.4.1 step 4 / cmds 0x39, 0x3A).
+        _ = try? proto.writeCommand(group: NNOGroup.system.rawValue, command: NNOSystemCommand.startScanInterpret)
+        let interpDeadline = Date().addingTimeInterval(3)
+        while Date() < interpDeadline {
+            if let st = try? proto.sendCommand(group: NNOGroup.system.rawValue, command: NNOSystemCommand.scanInterpretGetStatus),
+               let b = st.payload.first, b == 1 { break }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let interpret = (try? proto.readFile(fileType: .interpretData)) ?? []
+
+        var spectrum: Spectrum?
+        if !interpret.isEmpty, let s = try? Self.parseInterpretData(interpret) {
+            spectrum = Spectrum(points: s, serialNumber: serial, source: .simplex)
+        }
+
+        return ScanArtifacts(
+            spectrum: spectrum,
+            wavelengthRaw: wlRaw,
+            intensityRaw: inRaw,
+            completeScanRaw: complete,
+            interpretRaw: interpret,
+            estimatedScanTimeMS: estimated,
+            elapsedMS: Int(Date().timeIntervalSince(t0) * 1000),
+            serialNumber: serial,
+            mode: "complete+interpret"
+        )
+    }
+
     /// Complete path: serialized scan data. Not interpreted on macOS without dlpspec.
     public func readCompleteScanRaw() throws -> [UInt8] {
         try proto.readFile(fileType: .scanData)
@@ -258,70 +339,175 @@ public actor NIRDevice {
         try proto.readFile(fileType: fileType)
     }
 
+    // MARK: - CSV
+
+    public static func csvString(from spectrum: Spectrum, metadata: [String: String] = [:]) -> String {
+        var lines: [String] = []
+        lines.append("wavelength_nm,intensity")
+        for p in spectrum.points {
+            // Wavelength with 3 decimal places (nm); intensity as integer.
+            lines.append(String(format: "%.3f,%d", p.wavelength, p.intensity))
+        }
+        // Optional metadata as comment lines (ignored by most CSV readers).
+        if !metadata.isEmpty {
+            var meta: [String] = []
+            for key in metadata.keys.sorted() {
+                meta.append("# \(key)=\(metadata[key] ?? "")")
+            }
+            lines.insert(contentsOf: meta, at: 0)
+        }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// Parse NNO_FILE_INTERPRET_DATA (0x09) after Tiva START_SCAN_INTERPRET.
+    ///
+    /// Live 1024-byte dump shows repeating 8-byte groups of 4×uint16 LE that look like
+    /// (dark, sample, ref_a, ref_b) or similar ADC/intensity quads — NOT float wavelengths.
+    /// Until the official layout is confirmed, try documented/simple encodings only:
+    ///   1) interleaved float32 wavelength/intensity pairs
+    ///   2) two float32 arrays (wl[n], int[n])
+    ///   3) two uint16 arrays (wl×100 as nm×100, intensity)
+    /// If none fit, throw — caller keeps raw bytes. Do not invent wavelengths.
+    public static func parseInterpretData(_ raw: [UInt8]) throws -> [SpectrumPoint] {
+        // 1) interleaved f32 pairs: w,i,w,i…
+        if raw.count % 8 == 0 {
+            let n = raw.count / 8
+            if n >= 8 {
+                var points: [SpectrumPoint] = []
+                var ok = true
+                for i in 0..<n {
+                    let w = Double(Float(bitPattern: leU32(raw, i * 8)))
+                    let inten = Double(Float(bitPattern: leU32(raw, i * 8 + 4)))
+                    if w < 700 || w > 2500 { ok = false; break }
+                    points.append(SpectrumPoint(wavelength: w, intensity: Int(inten)))
+                }
+                if ok { return points }
+            }
+        }
+        // 2) two f32 halves
+        if raw.count % 8 == 0 {
+            let n = raw.count / 16 * 2
+            let half = raw.count / 2
+            if half % 4 == 0 {
+                let m = half / 4
+                var points: [SpectrumPoint] = []
+                var ok = m >= 8
+                for i in 0..<m where ok {
+                    let w = Double(Float(bitPattern: leU32(raw, i * 4)))
+                    let inten = Double(Float(bitPattern: leU32(raw, half + i * 4)))
+                    if w < 700 || w > 2500 { ok = false; break }
+                    points.append(SpectrumPoint(wavelength: w, intensity: Int(inten)))
+                }
+                if ok { return points }
+            }
+            _ = n
+        }
+        throw NIRProtocolError.spectrumParseFailed(
+            "interpret data \(raw.count)B layout not recognized as wavelength/intensity (kept as raw)"
+        )
+    }
+
     // MARK: - Simplex parse (documented types are provisional)
 
     /// Parse Simplex files.
     ///
     /// PDF does not state element width. EasyNIRLib exposes `double wavelength[]` and
-    /// `unsigned int intensity[]` after interpretation. This parser tries:
-    ///   1) float32 LE wavelength + int32 LE intensity
-    ///   2) float64 LE wavelength + int32 LE intensity
-    /// and rejects values outside a sane NIR range rather than inventing data.
+    /// `unsigned int intensity[]`. This parser tries common wire layouts and rejects
+    /// values outside a sane NIR range rather than inventing data:
+    ///   wavelength: float32 LE or float64 LE
+    ///   intensity:  int32 / uint16 / int16 LE
     public static func parseSimplex(wavelengthRaw: [UInt8], intensityRaw: [UInt8]) throws -> Spectrum {
-        if let points = try? parseWavelengthFloat32(wavelengthRaw, intensityRaw: intensityRaw) {
-            return Spectrum(points: points, source: .simplex)
-        }
-        if let points = try? parseWavelengthFloat64(wavelengthRaw, intensityRaw: intensityRaw) {
-            return Spectrum(points: points, source: .simplex)
+        let attempts: [(String, ( [UInt8], [UInt8]) throws -> [SpectrumPoint])] = [
+            ("f32/i32", parseWLFloat32_i32),
+            ("f32/u16", parseWLFloat32_u16),
+            ("f32/i16", parseWLFloat32_i16),
+            ("f64/i32", parseWLFloat64_i32),
+        ]
+        var errors: [String] = []
+        for (name, fn) in attempts {
+            do {
+                let points = try fn(wavelengthRaw, intensityRaw)
+                return Spectrum(points: points, source: .simplex)
+            } catch {
+                errors.append("\(name): \(error)")
+            }
         }
         throw NIRProtocolError.spectrumParseFailed(
-            "simplex wavelength/intensity sizes wl=\(wavelengthRaw.count) in=\(intensityRaw.count) not recognized as float32/int32 or float64/int32"
+            "simplex wl=\(wavelengthRaw.count)B in=\(intensityRaw.count)B not recognized — \(errors.joined(separator: "; "))"
         )
     }
 
-    private static func parseWavelengthFloat32(
-        _ wlRaw: [UInt8],
-        intensityRaw: [UInt8]
-    ) throws -> [SpectrumPoint] {
+    private static func leU32(_ b: [UInt8], _ i: Int) -> UInt32 {
+        UInt32(b[i]) | (UInt32(b[i + 1]) << 8) | (UInt32(b[i + 2]) << 16) | (UInt32(b[i + 3]) << 24)
+    }
+
+    private static func leU16(_ b: [UInt8], _ i: Int) -> UInt16 {
+        UInt16(b[i]) | (UInt16(b[i + 1]) << 8)
+    }
+
+    private static func checkWavelength(_ w: Double, index i: Int) throws {
+        // NIR-M-R2 STD is 900–1700 nm; allow a little margin.
+        guard w > 700, w < 2500 else {
+            throw NIRProtocolError.spectrumParseFailed("wavelength[\(i)]=\(w) out of NIR range")
+        }
+    }
+
+    private static func parseWLFloat32_i32(_ wlRaw: [UInt8], intensityRaw: [UInt8]) throws -> [SpectrumPoint] {
         guard wlRaw.count % 4 == 0, intensityRaw.count % 4 == 0 else {
-            throw NIRProtocolError.spectrumParseFailed("size not multiple of 4")
+            throw NIRProtocolError.spectrumParseFailed("size not f32/i32")
         }
         let n = min(wlRaw.count / 4, intensityRaw.count / 4)
-        guard n > 0 else {
-            throw NIRProtocolError.spectrumParseFailed("empty spectrum")
-        }
+        guard n > 0 else { throw NIRProtocolError.spectrumParseFailed("empty") }
         var points: [SpectrumPoint] = []
         points.reserveCapacity(n)
         for i in 0..<n {
-            let wbits = UInt32(wlRaw[i * 4])
-                | (UInt32(wlRaw[i * 4 + 1]) << 8)
-                | (UInt32(wlRaw[i * 4 + 2]) << 16)
-                | (UInt32(wlRaw[i * 4 + 3]) << 24)
-            let w = Double(Float(bitPattern: wbits))
-            let inten = Int32(bitPattern: UInt32(intensityRaw[i * 4])
-                | (UInt32(intensityRaw[i * 4 + 1]) << 8)
-                | (UInt32(intensityRaw[i * 4 + 2]) << 16)
-                | (UInt32(intensityRaw[i * 4 + 3]) << 24))
-            // NIR-M-R2 STD is 900–1700 nm; allow a little margin.
-            guard w > 700, w < 2500 else {
-                throw NIRProtocolError.spectrumParseFailed("wavelength[\(i)]=\(w) out of NIR range")
-            }
+            let w = Double(Float(bitPattern: leU32(wlRaw, i * 4)))
+            try checkWavelength(w, index: i)
+            let inten = Int32(bitPattern: leU32(intensityRaw, i * 4))
             points.append(SpectrumPoint(wavelength: w, intensity: Int(inten)))
         }
         return points
     }
 
-    private static func parseWavelengthFloat64(
-        _ wlRaw: [UInt8],
-        intensityRaw: [UInt8]
-    ) throws -> [SpectrumPoint] {
+    private static func parseWLFloat32_u16(_ wlRaw: [UInt8], intensityRaw: [UInt8]) throws -> [SpectrumPoint] {
+        guard wlRaw.count % 4 == 0, intensityRaw.count % 2 == 0 else {
+            throw NIRProtocolError.spectrumParseFailed("size not f32/u16")
+        }
+        let n = min(wlRaw.count / 4, intensityRaw.count / 2)
+        guard n > 0 else { throw NIRProtocolError.spectrumParseFailed("empty") }
+        var points: [SpectrumPoint] = []
+        points.reserveCapacity(n)
+        for i in 0..<n {
+            let w = Double(Float(bitPattern: leU32(wlRaw, i * 4)))
+            try checkWavelength(w, index: i)
+            points.append(SpectrumPoint(wavelength: w, intensity: Int(leU16(intensityRaw, i * 2))))
+        }
+        return points
+    }
+
+    private static func parseWLFloat32_i16(_ wlRaw: [UInt8], intensityRaw: [UInt8]) throws -> [SpectrumPoint] {
+        guard wlRaw.count % 4 == 0, intensityRaw.count % 2 == 0 else {
+            throw NIRProtocolError.spectrumParseFailed("size not f32/i16")
+        }
+        let n = min(wlRaw.count / 4, intensityRaw.count / 2)
+        guard n > 0 else { throw NIRProtocolError.spectrumParseFailed("empty") }
+        var points: [SpectrumPoint] = []
+        points.reserveCapacity(n)
+        for i in 0..<n {
+            let w = Double(Float(bitPattern: leU32(wlRaw, i * 4)))
+            try checkWavelength(w, index: i)
+            let inten = Int16(bitPattern: leU16(intensityRaw, i * 2))
+            points.append(SpectrumPoint(wavelength: w, intensity: Int(inten)))
+        }
+        return points
+    }
+
+    private static func parseWLFloat64_i32(_ wlRaw: [UInt8], intensityRaw: [UInt8]) throws -> [SpectrumPoint] {
         guard wlRaw.count % 8 == 0, intensityRaw.count % 4 == 0 else {
-            throw NIRProtocolError.spectrumParseFailed("size not float64/int32")
+            throw NIRProtocolError.spectrumParseFailed("size not f64/i32")
         }
         let n = min(wlRaw.count / 8, intensityRaw.count / 4)
-        guard n > 0 else {
-            throw NIRProtocolError.spectrumParseFailed("empty spectrum")
-        }
+        guard n > 0 else { throw NIRProtocolError.spectrumParseFailed("empty") }
         var points: [SpectrumPoint] = []
         points.reserveCapacity(n)
         for i in 0..<n {
@@ -330,13 +516,8 @@ public actor NIRDevice {
                 wbits |= UInt64(wlRaw[i * 8 + b]) << (8 * b)
             }
             let w = Double(bitPattern: wbits)
-            let inten = Int32(bitPattern: UInt32(intensityRaw[i * 4])
-                | (UInt32(intensityRaw[i * 4 + 1]) << 8)
-                | (UInt32(intensityRaw[i * 4 + 2]) << 16)
-                | (UInt32(intensityRaw[i * 4 + 3]) << 24))
-            guard w > 700, w < 2500 else {
-                throw NIRProtocolError.spectrumParseFailed("wavelength[\(i)]=\(w) out of NIR range")
-            }
+            try checkWavelength(w, index: i)
+            let inten = Int32(bitPattern: leU32(intensityRaw, i * 4))
             points.append(SpectrumPoint(wavelength: w, intensity: Int(inten)))
         }
         return points

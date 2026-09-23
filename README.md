@@ -63,31 +63,32 @@ swift run nir-cli info --debug
 | Device Status | `NNO_CMD_READ_DEVICE_STATUS` `0x04/0x03` |
 | Tiva / DLPC / Spectrum Lib / Cal 版本 | `NNO_CMD_TIVA_VER` `0x02/0x16` |
 
-## 已实现功能（第一阶段）
+## 已实现功能（第一阶段 + 扫描）
 
 - [x] USB HID 枚举（VID/PID 过滤，并打印实际值）
-- [x] 打开 / 关闭设备（hidapi）
-- [x] HID 应用帧编解码（ID / Flags / Sequence / Length / Command / Group / Data）
-- [x] Sequence / 错误标志校验
-- [x] Device Info：Serial、Model、HW、Status、7 项版本号
-- [x] 协议常量集中管理（无 magic number）
-- [x] Debug 模式 TX/RX hex dump
-- [x] 分层：`HIDTransport` / `NIRProtocol` / `NIRDevice`
-- [x] `Spectrum` / `SpectrumPoint` 数据模型（供后续 GUI）
-- [x] 扫描相关命令骨架（scan config / perform / status / file read）
+- [x] 打开 / 关闭设备（hidapi，64 字节无 Report ID）
+- [x] HID 请求帧编解码 + 实测紧凑响应帧
+- [x] Device Info：Serial、Model、HW、Status、7 项版本号（真机 C36R011 / Tiva 2.6.3）
+- [x] `nir-cli scan`：PERFORM_SCAN → 状态轮询 → FILE 多块读取
+- [x] 完整保存 `NNO_FILE_SCAN_DATA`（3822 B）与 `NNO_FILE_INTERPRET_DATA`（1024 B）
+- [x] 协议常量集中管理、Debug TX/RX、分层架构、`Spectrum` 模型
 
 ## 尚未实现 / 当前限制
 
-- **SwiftUI GUI**（CLI 稳定后再做）
-- **`nir-cli scan` 完整扫描链路**（协议层已预留；需真机验证 Simplex 路径）
-- **Complete scan（flag `0x00`）的 `dlpspec_scan_interpret` 解释**  
-  厂家 SDK **没有 macOS `.dylib`**，`dlpspec` / `IscSpec` 仅有 Windows/Linux/Android/STM32 二进制。  
-  **不伪造 wavelength/intensity。** 路径：
-  1. 首选 **Simplex**（`PERFORM_SCAN` flag `0x5A`）→ FILE `0x0C` 波长 + `0x0D` 强度（Tiva ≥ 2.5.0，设备端已解释）
-  2. Complete raw 存 `.bin`，待厂家 Mac 库或 `dlpspec` 源码
-- Simplex 元素类型（float32/int32 vs float64）文档未写死，解析时做范围校验并拒绝伪造
-- USB 多包 `FILE_GET_DATA` continuation 布局 PDF 未逐字节定义（见 `docs/sdk-analysis.md`）
-- Intel Mac：代码无平台绑定，未做通用二进制打包
+- **SwiftUI GUI**
+- **`scan.csv` 波长-强度**：当前设备扫描配置为 **Hadamard 1**（见 `scan_complete.bin` 内嵌名）。
+  - Simplex 文件 `0x0C`/`0x0D` 在本固件返回空
+  - `scan_complete.bin` 为 dlpspec 序列化格式（`tpl` magic），需 `dlpspec_scan_interpret`
+  - `scan_interpret.bin` 为设备端解释结果，**布局尚未官方确认**，拒绝伪造 `wavelength_nm`
+- 完整光谱 CSV 需要：厂家 macOS 库 / dlpspec 源码，或确认 INTERPRET_DATA 布局
+
+## 真机扫描结果（C36R011）
+
+```text
+Mode              : complete+interpret
+Complete scan raw : 3822 bytes  → scan_complete.bin
+Interpret raw     : 1024 bytes  → scan_interpret.bin
+```
 
 ## SDK 依赖说明
 

@@ -142,13 +142,12 @@ public final class NIRProtocolClient: @unchecked Sendable {
         return try NIRLE.u32(resp.payload)
     }
 
-    /// Read a "file" via NNO_CMD_FILE_GET_READSIZE + NNO_CMD_FILE_GET_DATA.
+    /// Read a "file" via NNO_CMD_FILE_GET_READSIZE + repeated NNO_CMD_FILE_GET_DATA.
     ///
-    /// USB continuation layout is not fully specified in the PDF. Strategy:
-    /// issue GET_DATA once, then keep reading reports and concatenate data
-    /// bytes after the 7-byte frame header until `expectedSize` is reached.
-    /// Raw reports are kept when debug is on so real-device layout can be adjusted
-    /// without inventing offsets.
+    /// UART §3.3.7: "Read the file size, and then **repeatedly read the file data**
+    /// until the data size is the same."
+    /// Live USB: each GET_DATA returns one logical chunk (length field ≈ 512),
+    /// itself fragmented across 64-byte reports. Send GET_DATA again for the next chunk.
     public func readFile(
         fileType: NNOFileType,
         timeoutMS: Int = NIRExchange.defaultTimeoutMS
@@ -158,6 +157,30 @@ public final class NIRProtocolClient: @unchecked Sendable {
 
         guard expected > 0 else { return [] }
 
+        var body = [UInt8]()
+        body.reserveCapacity(expected)
+        let budgetMS = max(timeoutMS, expected / 4 + 5000)
+        let deadline = Date().addingTimeInterval(Double(budgetMS) / 1000.0)
+
+        while body.count < expected && Date() < deadline {
+            let chunk = try readOneDataChunk(deadline: deadline)
+            if chunk.isEmpty {
+                transport.log("[NIR] WARN: empty GET_DATA chunk at \(body.count)/\(expected)")
+                continue
+            }
+            body.append(contentsOf: chunk)
+        }
+
+        guard body.count >= expected else {
+            throw NIRProtocolError.invalidScanData(
+                "file read incomplete: got \(body.count)/\(expected)"
+            )
+        }
+        return Array(body.prefix(expected))
+    }
+
+    /// One NNO_CMD_FILE_GET_DATA transaction → one logical data chunk.
+    private func readOneDataChunk(deadline: Date) throws -> [UInt8] {
         let seq = takeSequence()
         let hidBuf = NIRFrame.encodeHIDWrite(
             flags: NIRFlag.readReply,
@@ -168,37 +191,54 @@ public final class NIRProtocolClient: @unchecked Sendable {
         )
         try transport.write(hidBuf)
 
-        var body = [UInt8]()
-        body.reserveCapacity(expected)
-        let deadline = Date().addingTimeInterval(Double(max(timeoutMS, expected / 2 + 2000)) / 1000.0)
+        // First report carries compact header: flags, seq, length(total chunk), data…
+        guard Date() < deadline else { return [] }
+        let first = try transport.read(timeoutMS: NIRExchange.defaultTimeoutMS)
+        if isDebugLoggingEnabled {
+            transport.logHex(prefix: "RX-chunk0", data: first)
+        }
 
-        while body.count < expected && Date() < deadline {
+        guard first.count >= 4 else {
+            return extractFileChunk(from: first, remaining: 4096)
+        }
+
+        let chunkLen = Int(first[2]) | (Int(first[3]) << 8)
+        // Data after 4-byte compact header in the first report.
+        var body = [UInt8]()
+        if chunkLen > 0 {
+            let firstData = Array(first.dropFirst(4))
+            let n = min(chunkLen, firstData.count)
+            body.append(contentsOf: firstData.prefix(n))
+        } else if first.count > 4 {
+            // Header claimed 0 — treat rest as raw (should not happen).
+            body.append(contentsOf: first.dropFirst(4))
+        }
+
+        // Continuation reports until the declared chunk length is reached.
+        while body.count < chunkLen && Date() < deadline {
             let raw: [UInt8]
             do {
                 raw = try transport.read(timeoutMS: NIRExchange.defaultTimeoutMS)
             } catch NIRProtocolError.usbReadTimeout {
-                continue
+                break
             }
-
-            // Extract data after header when this looks like a framed report.
-            let chunk = extractFileChunk(from: raw, expectedCommand: NNOFileCommand.getData)
-            body.append(contentsOf: chunk)
-
-            // Fallback: if framing detection produced nothing useful but raw looks like pure payload,
-            // append the report without the leading report-id byte.
-            if chunk.isEmpty, raw.count > 1 {
-                // Keep going only if we still need bytes; do not invent — dump is available via debug.
-                transport.log("[NIR] WARN: no framed chunk in report (\(raw.count) bytes); raw dump follows")
-                transport.logHex(prefix: "RX", data: raw)
+            if isDebugLoggingEnabled {
+                transport.logHex(prefix: "RX-cont", data: raw)
+            }
+            let need = chunkLen - body.count
+            let piece = extractFileChunk(from: raw, remaining: need)
+            if piece.isEmpty {
+                // Last resort: whole report as raw body.
+                body.append(contentsOf: raw.prefix(need))
+            } else {
+                body.append(contentsOf: piece.prefix(need))
             }
         }
 
-        guard body.count >= expected else {
-            throw NIRProtocolError.invalidScanData(
-                "file read incomplete: got \(body.count)/\(expected)"
-            )
+        if isDebugLoggingEnabled {
+            transport.log("[NIR] chunk complete: \(body.count)/\(chunkLen) bytes")
         }
-        return Array(body.prefix(expected))
+        return body
     }
 
     // MARK: - Internals
@@ -237,34 +277,32 @@ public final class NIRProtocolClient: @unchecked Sendable {
     }
 
     /// Pull payload bytes out of one FILE_GET_DATA continuation report.
-    private func extractFileChunk(from raw: [UInt8], expectedCommand: UInt8) -> [UInt8] {
-        // Case A: framed application report (with or without report ID).
-        var frameBytes = raw
-        if frameBytes.first == 0x00, frameBytes.count >= NIRExchange.headerSize + NIRExchange.commandGroupSize + 1 {
-            // Likely report ID prefix when total is 65 or when [1] is not protocol ID 0 with plausible length.
-            if frameBytes.count == NIRExchange.hidWriteSize {
-                frameBytes = Array(frameBytes.dropFirst())
-            }
+    ///
+    /// Continuations after the first report of a chunk are typically **raw data**
+    /// (the chunk length is declared once in the first report). Prefer raw body;
+    /// only strip a compact header when it clearly yields a small framed payload
+    /// and `remaining` is large enough to be a multi-report chunk.
+    private func extractFileChunk(from raw: [UInt8], remaining: Int) -> [UInt8] {
+        guard !raw.isEmpty else { return [] }
+
+        // If this looks like a *new* compact response (flags plausible, length == remaining
+        // or length ≤ 60), take its data region. Otherwise treat as raw continuation.
+        if remaining > 64, let decoded = try? NIRFrame.decodeHIDRead(raw),
+           decoded.length == remaining || (decoded.length > 0 && decoded.length <= 60 && decoded.payload.count == decoded.length) {
+            return decoded.payload
         }
-        if frameBytes.count >= NIRExchange.headerSize + NIRExchange.commandGroupSize,
-           frameBytes[0] == NIRExchange.protocolID {
-            if let decoded = try? NIRFrame.decode(frameBytes),
-               decoded.command == expectedCommand || decoded.command == NNOFileCommand.getReadSize {
-                return decoded.payload
-            }
-            // Header present but decode failed: return data after 7-byte header.
-            let length = Int(frameBytes[3]) | (Int(frameBytes[4]) << 8)
-            if length >= 2, frameBytes.count > 7 {
-                return Array(frameBytes[7...])
-            }
+
+        // Full Table 2-1 frame: data after 7-byte header (rare on this device).
+        if raw.count >= 7, raw[0] == NIRExchange.protocolID,
+           let decoded = try? NIRFrame.decode(Array(raw.prefix(NIRExchange.hidPacketSize))),
+           decoded.length >= 2, decoded.command != 0 {
+            return decoded.payload
         }
-        // Case B: pure payload continuation (no frame header) — use whole report minus report ID.
-        if raw.count > 0, raw[0] != NIRExchange.protocolID || raw.count < 8 {
-            if raw.first == 0x00, raw.count == NIRExchange.hidWriteSize {
-                return Array(raw.dropFirst())
-            }
-            return raw
+
+        // Raw continuation body (the common case after the chunk's first report).
+        if raw.count == 65, raw[0] == 0x00 {
+            return Array(raw.dropFirst())
         }
-        return []
+        return raw
     }
 }
