@@ -6,3 +6,10 @@ DerivedData/
 scan.csv
 scan.bin
 *.raw
+
+# TI DLP Spectrum Library (export-controlled — do not commit)
+third_party/DLPSpectrumLibrary/
+third_party/vendor-objects/
+build/
+*.dylib
+*.o

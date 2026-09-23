@@ -18,6 +18,8 @@ struct NIRCLI {
                 try cmdInfo(debug: debug)
             case "scan":
                 try cmdScan(args: args, debug: debug)
+            case "interpret":
+                try cmdInterpret(args: args)
             case "help", "-h", "--help":
                 printUsage()
             default:
@@ -44,6 +46,7 @@ struct NIRCLI {
               nir-cli list [--all] [--debug]
               nir-cli info [--debug]
               nir-cli scan [--out scan.csv] [--raw] [--debug]
+              nir-cli interpret <scan_complete.bin> [--out scan.csv]
               nir-cli help
 
             Commands:
@@ -53,6 +56,8 @@ struct NIRCLI {
               scan   Run a Simplex scan (PERFORM_SCAN 0x5A) and save wavelength/intensity CSV
                      --out PATH   output CSV (default: scan.csv)
                      --raw        also save scan_wavelength.bin / scan_intensity.bin
+              interpret  Offline TI DLP Spectrum Library decode of serialized scan
+                     Requires third_party/DLPSpectrumLibrary sources (TIDCC49/TIDCC50).
 
             Options:
               --debug / -d   Hex-dump TX/RX HID frames and protocol logs
@@ -84,6 +89,45 @@ struct NIRCLI {
     static func flagValue(_ args: [String], _ name: String) -> String? {
         guard let i = args.firstIndex(of: name), i + 1 < args.count else { return nil }
         return args[i + 1]
+    }
+
+    /// Offline interpret via tools/interpret_scan (official dlpspec_scan_interpret).
+    static func cmdInterpret(args: [String]) throws {
+        guard let input = args.dropFirst().first(where: { !$0.hasPrefix("-") }) else {
+            FileHandle.standardError.write(Data("usage: nir-cli interpret <scan_complete.bin> [--out scan.csv]\n".utf8))
+            exit(2)
+        }
+        let out = flagValue(args, "--out") ?? "scan.csv"
+
+        let fm = FileManager.default
+        let cwd = fm.currentDirectoryPath
+        let toolPaths = [
+            cwd + "/build/interpret_scan",
+            cwd + "/.build/debug/interpret_scan",
+            cwd + "/nir-m-r2-macos/build/interpret_scan",
+        ]
+        guard let tool = toolPaths.first(where: { fm.isExecutableFile(atPath: $0) }) else {
+            print("TI DLP Spectrum Library offline tool is not built yet.")
+            print("")
+            print("1) Download TIDCC49 / TIDCC50 (TI export approval required):")
+            print("     https://www.ti.com/tool/download/TIDCC49")
+            print("     https://www.ti.com/tool/download/TIDCC50")
+            print("2) Copy C sources to third_party/DLPSpectrumLibrary/")
+            print("3) ./scripts/build-dlpspec.sh && ./scripts/build-interpret-tool.sh")
+            print("4) ./build/interpret_scan \(input) \(out)")
+            print("")
+            print("Refusing to invent wavelengths without official dlpspec_scan_interpret().")
+            exit(3)
+        }
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: tool)
+        p.arguments = [input, out]
+        try p.run()
+        p.waitUntilExit()
+        if p.terminationStatus != 0 {
+            throw NIRProtocolError.spectrumParseFailed("interpret_scan exit \(p.terminationStatus)")
+        }
     }
 
     static func cmdScan(args: [String], debug: Bool) throws {
