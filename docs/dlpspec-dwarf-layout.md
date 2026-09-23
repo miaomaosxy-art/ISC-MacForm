@@ -78,3 +78,5 @@ Related: `dlpspec_scan_read_data`, `dlpspec_deserialize`, `dlpspec_serialize`,
 - Size 3822 B, TPL-serialized (`tpl\0` magic, signature `S(uc#cccccccjjvvu$(f#f#)c#vccc)`)
 - Embedded name `Hadamard 1`, serial `C36R011`
 - Must be fed to `dlpspec_scan_interpret` — not cast to `scanResults` directly
+
+Vendor EasyNIRLib DWARF vs public dlpspec 2.0.3 ABI: MATCH

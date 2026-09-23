@@ -16,7 +16,7 @@ int nir_dlpspec_available(void)
 
 const char *nir_dlpspec_version_string(void)
 {
-    return "DLP Spectrum Library (vendor objects / TIDCC49-compatible API)";
+    return "2.0.3";
 }
 
 int nir_decode_scan(const uint8_t *data, size_t size, NIRDecodedSpectrum *result)

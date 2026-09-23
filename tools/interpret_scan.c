@@ -8,6 +8,7 @@
  *   ./build/interpret_scan scan_complete.bin [scan.csv]
  */
 #include "dlpspec_bridge.h"
+#include "dlpspec_version.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,6 +75,9 @@ int main(int argc, char **argv)
     fclose(f);
 
     printf("Input file         : %s (%ld bytes)\n", argv[1], sz);
+    printf("DLP Spectrum Library : %d.%d.%d\n",
+           DLPSPEC_VERSION_MAJOR, DLPSPEC_VERSION_MINOR, DLPSPEC_VERSION_BUILD);
+    printf("Architecture       : arm64\n");
     printf("DLP Spectrum decode: ");
     fflush(stdout);
 

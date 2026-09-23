@@ -1,21 +1,19 @@
 #!/usr/bin/env bash
-# Build offline interpret_scan tool against libdlpspec.
+# Build offline interpret_scan against locally built DLP Spectrum Library.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OUT="$ROOT/third_party/DLPSpectrumLibrary/build"
+OUT="$ROOT/build/dlpspec"
 BIN="$ROOT/build"
 mkdir -p "$BIN"
 
-if [[ ! -f "$OUT/libdlpspec.a" && ! -f "$OUT/libdlpspec.dylib" ]]; then
-  echo "libdlpspec not built. Run ./scripts/build-dlpspec.sh first." >&2
-  exit 1
-fi
+[[ -d "$OUT" ]] || { echo "Run ./scripts/build-dlpspec.sh first" >&2; exit 1; }
 
+# Prefer official headers from third_party (full structs) over recovered stubs.
 clang -O2 -g -std=c99 \
+  -I"$ROOT/third_party/DLPSpectrumLibrary" \
   -I"$ROOT/Sources/CDLPSpec/include" \
   -o "$BIN/interpret_scan" \
   "$ROOT/tools/interpret_scan.c" \
-  "$ROOT/Sources/CDLPSpec/dlpspec_bridge.c" \
   "$OUT"/dlpspec*.o "$OUT"/tpl*.o \
   -lm
 
