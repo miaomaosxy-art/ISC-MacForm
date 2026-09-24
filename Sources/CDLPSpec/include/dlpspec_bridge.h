@@ -38,10 +38,27 @@ typedef struct {
     uint8_t  cfg_num_sections;
 } NIRDecodedSpectrum;
 
+typedef struct {
+    int count;
+    double *wavelength;
+    int *sample_intensity;
+    int *reference_intensity;
+    int32_t return_code;
+    char message[256];
+} NIRInterpretedReference;
+
 /* Returns 0 on success (DLPSPEC_PASS). */
 int nir_decode_scan(const uint8_t *data, size_t size, NIRDecodedSpectrum *result);
 
 void nir_free_decoded_scan(NIRDecodedSpectrum *result);
+
+/* Both blobs are read-only. The official DLP routine maps the reference to
+ * the sample scan config (wavelength, pattern width, PGA) or returns an error. */
+int nir_interpret_reference(const uint8_t *sample, size_t sample_size,
+                            const uint8_t *reference, size_t reference_size,
+                            const uint8_t *matrix, size_t matrix_size,
+                            NIRInterpretedReference *result);
+void nir_free_interpreted_reference(NIRInterpretedReference *result);
 
 /* 1 if linked against official dlpspec_scan_interpret. */
 int nir_dlpspec_available(void);

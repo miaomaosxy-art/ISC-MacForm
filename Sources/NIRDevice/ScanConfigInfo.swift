@@ -2,7 +2,7 @@ import Foundation
 
 /// Scan configuration fields that exist in the protocol or serialized DLP config.
 /// Do not invent missing values — leave them nil and show "—" in the UI.
-public struct ScanConfigInfo: Sendable, Equatable {
+public struct ScanConfigInfo: Sendable, Equatable, Codable {
     /// Config display name from serialized scan config (e.g. "Hadamard 1").
     public var name: String?
     /// SCAN_TYPES raw value when known: 0 Column, 1 Hadamard, 2 Slew.

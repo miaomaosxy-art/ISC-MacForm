@@ -1,4 +1,5 @@
 import AppKit
+import DLPSpec
 import Foundation
 import NIRDevice
 import UniformTypeIdentifiers
@@ -47,6 +48,9 @@ enum SessionSaver {
         average: Spectrum?,
         serial: String?,
         saveRaw: Bool,
+        referenceAnalyses: [ReferenceAnalysis] = [],
+        referenceMetadata: ReferenceExportMetadata? = nil,
+        averageAnalysis: ReferenceAnalysis? = nil,
         date: Date = Date()
     ) -> Result<URL, SessionSaveError> {
         guard !scans.isEmpty else { return .failure(.noSpectra) }
@@ -71,7 +75,15 @@ enum SessionSaver {
             try FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
             for (i, scan) in scans.enumerated() {
                 let csvURL = sessionDir.appendingPathComponent(SpectrumFileNamer.scanCSVName(index: i + 1))
-                try scan.csvString().write(to: csvURL, atomically: true, encoding: .utf8)
+                let csv: String
+                if referenceAnalyses.indices.contains(i), let referenceMetadata {
+                    csv = try ReferenceCSV.string(sample: scan,
+                                                   analysis: referenceAnalyses[i],
+                                                   metadata: referenceMetadata)
+                } else {
+                    csv = scan.csvString()
+                }
+                try csv.write(to: csvURL, atomically: true, encoding: .utf8)
                 if saveRaw, let raw = scan.raw {
                     let binURL = sessionDir.appendingPathComponent(SpectrumFileNamer.scanRawName(index: i + 1))
                     try Data(raw).write(to: binURL)
@@ -79,7 +91,14 @@ enum SessionSaver {
             }
             if let average {
                 let avgURL = sessionDir.appendingPathComponent(SpectrumFileNamer.averageCSVName)
-                try average.csvString().write(to: avgURL, atomically: true, encoding: .utf8)
+                let csv: String
+                if let averageAnalysis, let referenceMetadata {
+                    csv = try ReferenceCSV.string(sample: average, analysis: averageAnalysis,
+                                                  metadata: referenceMetadata)
+                } else {
+                    csv = average.csvString()
+                }
+                try csv.write(to: avgURL, atomically: true, encoding: .utf8)
             }
             return .success(sessionDir)
         } catch {
@@ -89,7 +108,9 @@ enum SessionSaver {
 
     /// Save a single spectrum plus optional raw next to a chosen CSV (single-scan raw path).
     @MainActor
-    static func saveSingleCSVWithRaw(spectrum: Spectrum, serial: String?, saveRaw: Bool) -> Result<URL, SessionSaveError> {
+    static func saveSingleCSVWithRaw(spectrum: Spectrum, serial: String?, saveRaw: Bool,
+                                     analysis: ReferenceAnalysis? = nil,
+                                     referenceMetadata: ReferenceExportMetadata? = nil) -> Result<URL, SessionSaveError> {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.commaSeparatedText]
         panel.canCreateDirectories = true
@@ -101,7 +122,14 @@ enum SessionSaver {
             return .failure(.panelCancelled)
         }
         do {
-            try spectrum.csvString().write(to: url, atomically: true, encoding: .utf8)
+            let csv: String
+            if let analysis, let referenceMetadata {
+                csv = try ReferenceCSV.string(sample: spectrum, analysis: analysis,
+                                              metadata: referenceMetadata)
+            } else {
+                csv = spectrum.csvString()
+            }
+            try csv.write(to: url, atomically: true, encoding: .utf8)
             if saveRaw, let raw = spectrum.raw {
                 let binURL = url.deletingPathExtension().appendingPathExtension("bin")
                 try Data(raw).write(to: binURL)

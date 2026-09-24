@@ -105,6 +105,8 @@ Do not assume every response echoes Command/Group. Sequence is validated when no
 |------|------|-----|
 | `NNO_FILE_SCAN_DATA` | `0x00` | Serialized complete scan (feed to `dlpspec_scan_interpret`) |
 | `NNO_FILE_SCAN_CONFIG` | `0x01` | Scan config blob |
+| `NNO_FILE_REF_CAL_DATA` | `0x02` | Factory serialized reference scan, read only |
+| `NNO_FILE_REF_CAL_MATRIX` | `0x03` | Factory interpolation matrix, read only |
 | Simplex wavelength | `0x0C` | Empty on this firmware |
 | Simplex intensity | `0x0D` | Empty on this firmware |
 
@@ -157,6 +159,45 @@ wavelength[] + intensity[]     (228 points on this config)
 ```
 
 USB commands are **serialized**. Never overlap command/response pairs on one device.
+
+---
+
+## Reference Architecture
+
+The [official Windows `ISC-NIRScan-GUI` distribution](https://github.com/InnoSpectra/ISC-NIRScan-GUI)
+and its `isccpp.dll` call chain use three modes:
+
+| Mode | Source | Device writes |
+|------|--------|---------------|
+| Built-In (`0`) | `SPEC_FetchRefCalData` from device | None |
+| Previous (`1`) | Previously scanned white reference on host | None |
+| New (`2`) | One normal complete scan of a physical white target, saved on host | None |
+
+New switches to Previous after the successful host save. MacForm stores the raw
+serialized scan and metadata under Application Support, scoped by device serial.
+Previous reloads that raw blob, checks the serial, and reinterprets it with the
+official library. Built-In reads `NNO_FILE_REF_CAL_DATA` and
+`NNO_FILE_REF_CAL_MATRIX` with the same multi-chunk file transfer loop used for
+ordinary scans. The factory cache is scoped to the connected serial and cleared
+on disconnect. No reference calibration write command is used in this workflow.
+
+For each sample, `dlpspec_scan_interpret` returns black-level-corrected sample
+intensity. `dlpspec_scan_interpReference` interprets the reference blob and maps
+it to the sample scan configuration. It compares the configs, scales for PGA,
+and, when needed and valid, interpolates wavelength and applies the width
+dependent matrix correction. An incompatible config returns an error; the host
+must not silently divide unaligned arrays.
+
+Windows `SPEC_GetReflectance` then computes interpreted sample intensity divided
+by interpreted reference intensity. `SPEC_GetAbsorbance` computes
+`-log10(reflectance)`. MacForm marks nonpositive inputs invalid in the data model
+and omits those chart points and CSV cells. The Windows `SPEC_SetData` routine
+substitutes `1` for an individual zero interpreted reference point; this is
+distinct from a missing or invalid factory reference blob, which is an error.
+
+The checked-in synthetic matrix fixture and recorded complete scan cover the
+offline DLP calculation path. They do not substitute for a same-device Windows
+GUI comparison or a physical white-target scan.
 
 ---
 

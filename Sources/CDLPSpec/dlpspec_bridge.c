@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 int nir_dlpspec_available(void)
 {
@@ -171,5 +172,111 @@ void nir_free_decoded_scan(NIRDecodedSpectrum *result)
     free(result->intensity);
     result->wavelength = NULL;
     result->intensity = NULL;
+    result->count = 0;
+}
+
+int nir_interpret_reference(const uint8_t *sample, size_t sample_size,
+                            const uint8_t *reference, size_t reference_size,
+                            const uint8_t *matrix, size_t matrix_size,
+                            NIRInterpretedReference *result)
+{
+    if (!result) return ERR_DLPSPEC_NULL_POINTER;
+    memset(result, 0, sizeof(*result));
+    if (!sample || !reference || !matrix ||
+        sample_size == 0 || reference_size == 0 || matrix_size == 0) {
+        result->return_code = ERR_DLPSPEC_INVALID_INPUT;
+        snprintf(result->message, sizeof(result->message), "missing scan or calibration blob");
+        return result->return_code;
+    }
+
+    scanResults *sample_results = (scanResults *)calloc(1, sizeof(scanResults));
+    scanResults *reference_results = (scanResults *)calloc(1, sizeof(scanResults));
+    if (!sample_results || !reference_results) {
+        free(sample_results);
+        free(reference_results);
+        result->return_code = ERR_DLPSPEC_INSUFFICIENT_MEM;
+        return result->return_code;
+    }
+
+    int rc = dlpspec_scan_interpret(sample, sample_size, sample_results);
+    if (rc == DLPSPEC_PASS && sample_results->pga == 0) {
+        rc = ERR_DLPSPEC_INVALID_INPUT;
+    }
+    if (rc == DLPSPEC_PASS) {
+        rc = dlpspec_scan_interpReference(reference, reference_size,
+                                           matrix, matrix_size,
+                                           sample_results, reference_results);
+    }
+    if (rc == DLPSPEC_PASS && reference_results->pga == 0) {
+        rc = ERR_DLPSPEC_INVALID_INPUT;
+    }
+    if (rc != DLPSPEC_PASS) {
+        result->return_code = rc;
+        snprintf(result->message, sizeof(result->message),
+                 "DLP reference interpretation failed (%d); check reference coverage and scan config", rc);
+        goto done;
+    }
+
+    const int count = sample_results->length;
+    if (count <= 0 || count > 864 || reference_results->length != count) {
+        result->return_code = ERR_DLPSPEC_INVALID_INPUT;
+        snprintf(result->message, sizeof(result->message),
+                 "sample/reference point count mismatch (%d/%d)", count, reference_results->length);
+        goto done;
+    }
+    for (int i = 0; i < count; i++) {
+        if (!isfinite(sample_results->wavelength[i]) ||
+            !isfinite(reference_results->wavelength[i]) ||
+            fabs(sample_results->wavelength[i] - reference_results->wavelength[i]) > 0.01) {
+            result->return_code = ERR_DLPSPEC_INVALID_INPUT;
+            snprintf(result->message, sizeof(result->message),
+                     "sample/reference wavelength mismatch at %d", i);
+            goto done;
+        }
+    }
+    int nonzero_reference_points = 0;
+    for (int i = 0; i < count; i++) {
+        if (reference_results->intensity[i] != 0) nonzero_reference_points++;
+    }
+    if (nonzero_reference_points == 0) {
+        result->return_code = ERR_DLPSPEC_INVALID_INPUT;
+        snprintf(result->message, sizeof(result->message), "all reference intensities are zero");
+        goto done;
+    }
+
+    result->wavelength = (double *)malloc(sizeof(double) * (size_t)count);
+    result->sample_intensity = (int *)malloc(sizeof(int) * (size_t)count);
+    result->reference_intensity = (int *)malloc(sizeof(int) * (size_t)count);
+    if (!result->wavelength || !result->sample_intensity || !result->reference_intensity) {
+        nir_free_interpreted_reference(result);
+        result->return_code = ERR_DLPSPEC_INSUFFICIENT_MEM;
+        goto done;
+    }
+    result->count = count;
+    for (int i = 0; i < count; i++) {
+        result->wavelength[i] = sample_results->wavelength[i];
+        result->sample_intensity[i] = sample_results->intensity[i];
+        /* Windows SPEC_SetData substitutes 1 for zero after DLP interpolation. */
+        result->reference_intensity[i] = reference_results->intensity[i] == 0
+            ? 1 : reference_results->intensity[i];
+    }
+    result->return_code = DLPSPEC_PASS;
+    snprintf(result->message, sizeof(result->message), "OK");
+
+done:
+    free(sample_results);
+    free(reference_results);
+    return result->return_code;
+}
+
+void nir_free_interpreted_reference(NIRInterpretedReference *result)
+{
+    if (!result) return;
+    free(result->wavelength);
+    free(result->sample_intensity);
+    free(result->reference_intensity);
+    result->wavelength = NULL;
+    result->sample_intensity = NULL;
+    result->reference_intensity = NULL;
     result->count = 0;
 }

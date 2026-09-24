@@ -103,8 +103,18 @@ public enum DLPSpectrumDecoder {
             numSections: out.cfg_num_sections != 0 ? Int(out.cfg_num_sections) : nil
         )
 
+        var scanDate = DateComponents()
+        scanDate.year = 2000 + Int(out.year)
+        scanDate.month = Int(out.month) + 1
+        scanDate.day = Int(out.day)
+        scanDate.hour = Int(out.hour)
+        scanDate.minute = Int(out.minute)
+        scanDate.second = Int(out.second)
+        let recordedDate = out.month < 12 && out.day >= 1 && out.day <= 31 &&
+            out.hour < 24 && out.minute < 60 && out.second < 61
+            ? Calendar.current.date(from: scanDate) : nil
         let spectrum = Spectrum(
-            timestamp: Date(),
+            timestamp: recordedDate ?? Date(),
             points: zip(wavelengths, intensities).map { SpectrumPoint(wavelength: $0, intensity: Int($1)) },
             temperature: out.temperature,
             humidity: out.humidity,

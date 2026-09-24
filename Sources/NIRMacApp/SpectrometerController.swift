@@ -39,6 +39,32 @@ enum SpectrumDisplayMode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum ReferenceSource: String, CaseIterable, Identifiable {
+    case builtIn = "Built-In"
+    case new = "New"
+    case previous = "Previous"
+    var id: String { rawValue }
+}
+
+struct SpectrumPlotPoint: Identifiable {
+    let wavelength: Double
+    let value: Double
+    var id: Double { wavelength }
+}
+
+struct SpectrumPlotSeries: Identifiable {
+    let id: Int
+    let label: String
+    let points: [SpectrumPlotPoint]
+}
+
+struct ReferenceDetails {
+    let timestamp: Date?
+    let configName: String?
+    let pga: Int?
+    let serialNumber: String?
+}
+
 // MARK: - Controller
 
 /// Single owner of device lifecycle and scan state.
@@ -53,6 +79,13 @@ final class SpectrometerController: ObservableObject {
     @Published var recentScans: [Spectrum] = []
     @Published var averageSpectrum: Spectrum?
     @Published var displayMode: SpectrumDisplayMode = .individual
+    @Published var quantity: SpectrumQuantity = .intensity
+    @Published var referenceSource: ReferenceSource = .builtIn
+    @Published private(set) var referenceAnalyses: [ReferenceAnalysis] = []
+    @Published private(set) var referenceError: String?
+    @Published private(set) var referenceStatus: String = "Factory reference on device"
+    @Published private(set) var referenceDetails: ReferenceDetails?
+    @Published private(set) var referenceReady = false
 
     @Published var scanPhase: ScanPhase = .idle
     @Published var scanProgressText: String?
@@ -73,6 +106,12 @@ final class SpectrometerController: ObservableObject {
     private var hasEverConnected = false
     private var isConnecting = false
     private let device = NIRDevice(debugLogging: false)
+    private let referenceStore = ReferenceStore()
+    private var factoryReferenceRaw: [UInt8]?
+    private var factoryReferenceSerial: String?
+    private var referenceMatrixRaw: [UInt8]?
+    private var localReference: LocalReference?
+    private var referenceGeneration = 0
     private var pollTask: Task<Void, Never>?
 
     private var isConnected: Bool {
@@ -84,6 +123,10 @@ final class SpectrometerController: ObservableObject {
 
     var canScan: Bool {
         isConnected && !scanPhase.isBusy
+    }
+
+    var canSampleScan: Bool {
+        canScan && referenceReady && referenceSource != .new
     }
 
     var canSave: Bool {
@@ -106,6 +149,67 @@ final class SpectrometerController: ObservableObject {
             return [avg]
         }
         return recentScans.isEmpty ? (spectrum.map { [$0] } ?? []) : recentScans
+    }
+
+    var displayedPlotSeries: [SpectrumPlotSeries] {
+        if quantity == .intensity {
+            return displayedSeries.enumerated().map { index, scan in
+                SpectrumPlotSeries(
+                    id: index,
+                    label: displayMode == .average && averageSpectrum != nil
+                        ? "Average" : String(format: "Scan %03d", index + 1),
+                    points: scan.points.map {
+                        SpectrumPlotPoint(wavelength: $0.wavelength, value: Double($0.intensity))
+                    }
+                )
+            }
+        }
+        guard referenceAnalyses.count == recentScans.count else { return [] }
+        if displayMode == .average, let analysis = averageReferenceAnalysis {
+            return [SpectrumPlotSeries(id: 0, label: "Average",
+                points: zip(analysis.wavelengths, analysis.values(for: quantity)).compactMap { wavelength, value in
+                    value.map { SpectrumPlotPoint(wavelength: wavelength, value: $0) }
+                })]
+        }
+        return referenceAnalyses.enumerated().map { index, analysis in
+            SpectrumPlotSeries(
+                id: index,
+                label: String(format: "Scan %03d", index + 1),
+                points: zip(analysis.wavelengths, analysis.values(for: quantity)).compactMap { wavelength, value in
+                    value.map { SpectrumPlotPoint(wavelength: wavelength, value: $0) }
+                }
+            )
+        }
+    }
+
+    var invalidAbsorbanceCount: Int {
+        referenceAnalyses.reduce(0) { $0 + $1.invalidAbsorbanceCount }
+    }
+
+    var invalidReflectanceCount: Int {
+        referenceAnalyses.reduce(0) { $0 + ($1.reflectance.count - $1.finiteReflectanceCount) }
+    }
+
+    var hasDerivedSpectrum: Bool {
+        !referenceAnalyses.isEmpty && referenceAnalyses.count == recentScans.count
+    }
+
+    var canAverageDerived: Bool { averageReferenceAnalysis != nil }
+
+    private var averageReferenceAnalysis: ReferenceAnalysis? {
+        guard let averageSpectrum, let first = referenceAnalyses.first,
+              referenceAnalyses.count == recentScans.count,
+              referenceAnalyses.allSatisfy({ $0.referenceIntensity == first.referenceIntensity &&
+                  $0.wavelengths == first.wavelengths }) else { return nil }
+        return try? ReferenceAnalysis.average(sample: averageSpectrum, reference: first)
+    }
+
+    private var referenceExportMetadata: ReferenceExportMetadata? {
+        guard let referenceDetails else { return nil }
+        return ReferenceExportMetadata(source: referenceSource.rawValue,
+            referenceTimestamp: referenceDetails.timestamp,
+            referenceConfig: referenceDetails.configName,
+            referencePGA: referenceDetails.pga)
     }
 
     var serialForFilename: String? {
@@ -131,6 +235,7 @@ final class SpectrometerController: ObservableObject {
         pollTask = nil
         Task { await device.disconnect() }
         connectionState = .disconnected
+        referenceReady = false
     }
 
     /// 1 s presence poll (Phase 1). IOHIDManager callbacks can replace this later.
@@ -161,6 +266,13 @@ final class SpectrometerController: ObservableObject {
             await device.disconnect()
             connectionState = .disconnected
             deviceInfo = nil
+            factoryReferenceRaw = nil
+            factoryReferenceSerial = nil
+            referenceMatrixRaw = nil
+            localReference = nil
+            referenceAnalyses = []
+            referenceReady = false
+            referenceDetails = nil
             scanConfig = mergeScanConfig(scanConfig, active: nil, count: nil)
             statusMessage = "No spectrometer connected"
             DebugLog.app("state → disconnected")
@@ -189,7 +301,12 @@ final class SpectrometerController: ObservableObject {
                 deviceInfo = info
                 DebugLog.app("device info serial=\(info.serialNumber) model=\(info.modelName)")
             }
+            factoryReferenceRaw = nil
+            factoryReferenceSerial = nil
+            referenceMatrixRaw = nil
+            localReference = nil
             await refreshScanConfig()
+            await prepareReferenceSource()
             statusMessage = nil
         } catch {
             await device.disconnect()
@@ -205,6 +322,13 @@ final class SpectrometerController: ObservableObject {
         await device.disconnect()
         connectionState = .disconnected
         deviceInfo = nil
+        factoryReferenceRaw = nil
+        factoryReferenceSerial = nil
+        referenceMatrixRaw = nil
+        localReference = nil
+        referenceAnalyses = []
+        referenceReady = false
+        referenceDetails = nil
         statusMessage = "No spectrometer connected"
         DebugLog.app("manual disconnect")
     }
@@ -229,13 +353,222 @@ final class SpectrometerController: ObservableObject {
         scanConfig = info
     }
 
+    // MARK: - Reference workflow
+
+    /// Selecting Previous reads only the Mac app's saved white scan. Built-In
+    /// reads device files only; neither selection writes reference calibration.
+    func prepareReferenceSource() async {
+        referenceGeneration += 1
+        let generation = referenceGeneration
+        referenceAnalyses = []
+        referenceError = nil
+        referenceReady = false
+        referenceDetails = nil
+        guard isConnected else {
+            referenceStatus = "Connect a spectrometer to use a reference"
+            return
+        }
+        switch referenceSource {
+        case .builtIn:
+            localReference = nil
+            referenceStatus = "Reading factory reference from device…"
+            do {
+                guard let serial = deviceInfo?.serialNumber, !serial.isEmpty else {
+                    referenceError = "Device serial number is unavailable."
+                    return
+                }
+                if factoryReferenceSerial != serial {
+                    factoryReferenceRaw = nil
+                    referenceMatrixRaw = nil
+                    factoryReferenceSerial = serial
+                }
+                if referenceMatrixRaw == nil {
+                    let matrix = try await device.readFileRaw(fileType: .refCalMatrix)
+                    guard generation == referenceGeneration else { return }
+                    guard !matrix.isEmpty else {
+                        referenceError = "Built-in reference calibration matrix is missing."
+                        return
+                    }
+                    referenceMatrixRaw = matrix
+                }
+                if factoryReferenceRaw == nil {
+                    let raw = try await device.readFileRaw(fileType: .refCalData)
+                    guard generation == referenceGeneration else { return }
+                    guard !raw.isEmpty else {
+                        referenceError = "No valid built-in reference calibration data was found. Please acquire a new reference."
+                        return
+                    }
+                    factoryReferenceRaw = raw
+                }
+                guard let factoryReferenceRaw else { return }
+                let decoded = try DLPSpectrumDecoder.decode(factoryReferenceRaw)
+                guard decoded.serialNumber == nil || decoded.serialNumber == serial else {
+                    referenceError = "Built-in reference belongs to another device."
+                    return
+                }
+                referenceDetails = ReferenceDetails(timestamp: decoded.timestamp,
+                    configName: decoded.configurationName, pga: decoded.pga,
+                    serialNumber: decoded.serialNumber)
+                referenceStatus = "Built-In Factory Reference"
+                referenceReady = true
+            } catch {
+                guard generation == referenceGeneration else { return }
+                referenceError = "No valid built-in reference calibration data was found. Please acquire a new reference."
+                DebugLog.dlp("factory reference load FAIL: \(error)")
+                return
+            }
+        case .new:
+            localReference = nil
+            referenceStatus = "Place the standard white target, then scan reference"
+        case .previous:
+            localReference = nil
+            referenceStatus = "Loading local white reference…"
+            guard let serial = deviceInfo?.serialNumber else {
+                referenceError = "Connect the spectrometer to load its previous reference."
+                return
+            }
+            do {
+                guard let saved = try referenceStore.load(serialNumber: serial) else {
+                    referenceError = "No local reference is available. Please acquire a new reference first."
+                    return
+                }
+                let decoded = try DLPSpectrumDecoder.decode([UInt8](saved.rawScan))
+                guard decoded.serialNumber == nil || decoded.serialNumber == serial else {
+                    throw ReferenceStoreError.deviceMismatch
+                }
+                if referenceMatrixRaw == nil {
+                    let matrix = try await device.readFileRaw(fileType: .refCalMatrix)
+                    guard generation == referenceGeneration else { return }
+                    guard !matrix.isEmpty else { throw ReferenceAnalysisError.missingCalibration }
+                    referenceMatrixRaw = matrix
+                }
+                localReference = saved
+                referenceStatus = "Local white reference from \(saved.capturedAt.formatted(date: .abbreviated, time: .shortened))"
+                referenceDetails = ReferenceDetails(timestamp: saved.capturedAt,
+                    configName: saved.config?.name ?? decoded.configurationName,
+                    pga: saved.pga ?? decoded.pga,
+                    serialNumber: saved.serialNumber)
+                referenceReady = true
+            } catch {
+                guard generation == referenceGeneration else { return }
+                referenceError = "Saved reference cannot be loaded: \(error)"
+                return
+            }
+        }
+        if referenceReady { await refreshReferenceAnalyses() }
+    }
+
+    /// A normal complete scan of a physical white target; no reference-write
+    /// command is sent to the device. Persist only after decode succeeds.
+    func scanNewReference() async {
+        guard referenceSource == .new, canScan else { return }
+        guard let serial = deviceInfo?.serialNumber, !serial.isEmpty else {
+            lastError = "Device serial number is required to save a white reference."
+            return
+        }
+        scanPhase = .starting
+        scanProgressText = "Scanning white reference…"
+        lastError = nil
+        referenceError = nil
+        do {
+            scanPhase = .scanning
+            let result = try await device.runCompleteScan()
+            scanPhase = .decoding
+            scanProgressText = "Validating white reference…"
+            let decoded = try DLPSpectrumDecoder.decode(result.raw)
+            guard decoded.serialNumber == nil || decoded.serialNumber == serial else {
+                throw ReferenceStoreError.deviceMismatch
+            }
+            let saved = LocalReference(serialNumber: serial, capturedAt: decoded.timestamp,
+                rawScan: Data(result.raw), config: decoded.config, pga: decoded.pga,
+                temperature: decoded.temperature, humidity: decoded.humidity)
+            try referenceStore.save(saved)
+            localReference = saved
+            referenceSource = .previous
+            referenceStatus = "Local white reference from \(saved.capturedAt.formatted(date: .abbreviated, time: .shortened))"
+            referenceDetails = ReferenceDetails(timestamp: saved.capturedAt,
+                configName: decoded.configurationName, pga: decoded.pga,
+                serialNumber: serial)
+            referenceReady = true
+            scanPhase = .completed
+            scanProgressText = nil
+            statusMessage = "White reference saved. Previous is now active."
+            await refreshReferenceAnalyses()
+        } catch {
+            scanPhase = .idle
+            scanProgressText = nil
+            lastError = "White reference scan failed: \(humanMessage(for: error))"
+        }
+    }
+
+    private func refreshReferenceAnalyses() async {
+        guard !recentScans.isEmpty else { return }
+        let generation = referenceGeneration
+        do {
+            let matrix: [UInt8]
+            if let cached = referenceMatrixRaw {
+                matrix = cached
+            } else {
+                matrix = try await device.readFileRaw(fileType: .refCalMatrix)
+                guard generation == referenceGeneration else { return }
+                guard !matrix.isEmpty else { throw ReferenceAnalysisError.missingCalibration }
+                referenceMatrixRaw = matrix
+            }
+
+            let rawReference: [UInt8]
+            if referenceSource == .builtIn {
+                if let cached = factoryReferenceRaw {
+                    rawReference = cached
+                } else {
+                    rawReference = try await device.readFileRaw(fileType: .refCalData)
+                    guard generation == referenceGeneration else { return }
+                    guard !rawReference.isEmpty else { throw ReferenceAnalysisError.referenceMismatch }
+                    factoryReferenceRaw = rawReference
+                }
+            } else {
+                guard let localReference else {
+                    throw ReferenceAnalysisError.referenceMismatch
+                }
+                rawReference = [UInt8](localReference.rawScan)
+            }
+
+            let analyses = try recentScans.map {
+                try ReferenceAnalysis.analyze(sample: $0, referenceRaw: rawReference, matrixRaw: matrix)
+            }
+            guard generation == referenceGeneration else { return }
+            referenceAnalyses = analyses
+            referenceError = nil
+        } catch {
+            guard generation == referenceGeneration else { return }
+            referenceAnalyses = []
+            if let error = error as? ReferenceAnalysisError {
+                referenceError = error.userMessage
+            } else {
+                referenceError = "Reference interpretation failed: \(humanMessage(for: error))"
+            }
+            DebugLog.dlp("reference FAIL: \(error)")
+        }
+    }
+
     // MARK: - Scan state machine
 
     func startScan() async {
+        guard canSampleScan else {
+            if referenceSource == .new && localReference == nil {
+                lastError = "Scan a white reference before scanning a sample."
+            }
+            return
+        }
         await runScans(count: 1, isRepeat: false)
     }
 
     func startRepeatScan() async {
+        guard canSampleScan else {
+            if referenceSource == .new && localReference == nil {
+                lastError = "Scan a white reference before scanning a sample."
+            }
+            return
+        }
         await runScans(count: max(1, repeatCount), isRepeat: true)
     }
 
@@ -249,6 +582,8 @@ final class SpectrometerController: ObservableObject {
         }
 
         recentScans = []
+        referenceAnalyses = []
+        referenceError = nil
         averageSpectrum = nil
         spectrum = nil
         lastError = nil
@@ -343,6 +678,7 @@ final class SpectrometerController: ObservableObject {
             recentScans.append(stored)
             spectrum = stored
             scanConfig = cfg
+            await refreshReferenceAnalyses()
             DebugLog.scan("complete \(stored.points.count) points")
             return true
         } catch {
@@ -385,6 +721,7 @@ final class SpectrometerController: ObservableObject {
         spectrum = nil
         recentScans = []
         averageSpectrum = nil
+        referenceAnalyses = []
         statusMessage = nil
         lastError = nil
         scanPhase = .idle
@@ -403,7 +740,9 @@ final class SpectrometerController: ObservableObject {
         switch SessionSaver.saveSingleCSVWithRaw(
             spectrum: spectrum,
             serial: serialForFilename,
-            saveRaw: saveRawEnabled
+            saveRaw: saveRawEnabled,
+            analysis: hasDerivedSpectrum ? referenceAnalyses.first : nil,
+            referenceMetadata: hasDerivedSpectrum ? referenceExportMetadata : nil
         ) {
         case .success(let url):
             statusMessage = "Saved \(url.lastPathComponent)"
@@ -423,7 +762,10 @@ final class SpectrometerController: ObservableObject {
             scans: scans,
             average: averageSpectrum,
             serial: serialForFilename,
-            saveRaw: saveRawEnabled
+            saveRaw: saveRawEnabled,
+            referenceAnalyses: hasDerivedSpectrum ? referenceAnalyses : [],
+            referenceMetadata: hasDerivedSpectrum ? referenceExportMetadata : nil,
+            averageAnalysis: averageReferenceAnalysis
         ) {
         case .success(let url):
             statusMessage = "Saved session \(url.lastPathComponent)"
@@ -480,7 +822,12 @@ final class SpectrometerController: ObservableObject {
         if let e = error as? SpectrumAverageError {
             return e.userMessage
         }
+        if let e = error as? ReferenceAnalysisError {
+            return e.userMessage
+        }
+        if let e = error as? ReferenceStoreError {
+            return e.description
+        }
         return "Unexpected error."
     }
 }
-

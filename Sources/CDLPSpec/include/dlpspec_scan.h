@@ -53,6 +53,12 @@ typedef struct {
 DLPSPEC_ERR_CODE dlpspec_scan_interpret(const void *pBuf,
                                         const size_t bufSize,
                                         scanResults *pResults);
+DLPSPEC_ERR_CODE dlpspec_scan_interpReference(const void *pRefCal,
+                                              size_t calSize,
+                                              const void *pMatrix,
+                                              size_t matrixSize,
+                                              const scanResults *pScanResults,
+                                              scanResults *pRefResults);
 
 #ifdef __cplusplus
 }
