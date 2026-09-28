@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import DLPSpec
 import HIDTransport
 import NIRDevice
@@ -19,6 +20,8 @@ struct NIRCLI {
                 try cmdInfo(debug: debug)
             case "config":
                 try cmdConfig(debug: debug)
+            case "reference-hash":
+                try cmdReferenceHash(debug: debug)
             case "scan":
                 try cmdScan(args: args, debug: debug)
             case "repeat":
@@ -53,6 +56,7 @@ struct NIRCLI {
               nir-cli list [--all] [--debug]
               nir-cli info [--debug]
               nir-cli config [--debug]
+              nir-cli reference-hash [--debug]
               nir-cli scan [--out scan.csv] [--raw] [--debug]
               nir-cli repeat [--count 5] [--out DIR] [--raw] [--debug]
               nir-cli selftest [--debug]
@@ -64,6 +68,7 @@ struct NIRCLI {
                      --all  also show every HID device on the system
               info   Open the first NIR-M-R2 and print Device Info
               config Print scan config (protocol index/count + decoded fields)
+              reference-hash  Read-only SHA-256 of factory reference and matrix
               scan   Complete scan → DLP Spectrum Library decode → scan.csv
                      --out PATH   output CSV (default: scan.csv)
                      --raw        also keep scan_complete.bin (always written)
@@ -306,6 +311,22 @@ struct NIRCLI {
     }
 
     // MARK: - config / repeat / selftest
+
+    static func cmdReferenceHash(debug: Bool) throws {
+        let snapshot: (String, [UInt8], [UInt8]) = try withDevice(debug: debug) { device in
+            _ = try await device.connect()
+            let info = try await device.getDeviceInfo()
+            let reference = try await device.readFileRaw(fileType: .refCalData)
+            let matrix = try await device.readFileRaw(fileType: .refCalMatrix)
+            return (info.serialNumber, reference, matrix)
+        }
+        func digest(_ bytes: [UInt8]) -> String {
+            SHA256.hash(data: Data(bytes)).map { String(format: "%02x", $0) }.joined()
+        }
+        print("Serial: \(snapshot.0)")
+        print("Factory reference: \(snapshot.1.count) B SHA-256 \(digest(snapshot.1))")
+        print("Reference matrix: \(snapshot.2.count) B SHA-256 \(digest(snapshot.2))")
+    }
 
     static func withDevice<T>(debug: Bool, _ body: @escaping @Sendable (NIRDevice) async throws -> T) throws -> T {
         let device = NIRDevice(debugLogging: debug)

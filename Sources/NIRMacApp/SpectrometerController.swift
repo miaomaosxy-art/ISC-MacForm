@@ -473,13 +473,16 @@ final class SpectrometerController: ObservableObject {
         do {
             scanPhase = .scanning
             let result = try await device.runCompleteScan()
+            let capturedAt = Date()
             scanPhase = .decoding
             scanProgressText = "Validating white reference…"
             let decoded = try DLPSpectrumDecoder.decode(result.raw)
             guard decoded.serialNumber == nil || decoded.serialNumber == serial else {
                 throw ReferenceStoreError.deviceMismatch
             }
-            let saved = LocalReference(serialNumber: serial, capturedAt: decoded.timestamp,
+            // The spectrometer RTC can be stale. Use the Mac acquisition time for
+            // local history; the original device timestamp remains in rawScan.
+            let saved = LocalReference(serialNumber: serial, capturedAt: capturedAt,
                 rawScan: Data(result.raw), config: decoded.config, pga: decoded.pga,
                 temperature: decoded.temperature, humidity: decoded.humidity)
             try referenceStore.save(saved)
@@ -644,6 +647,7 @@ final class SpectrometerController: ObservableObject {
             DebugLog.scan("phase=scanning")
 
             let result = try await device.runCompleteScan()
+            let capturedAt = Date()
 
             scanPhase = .readingData
             scanProgressText = total > 1 ? "Reading \(index) / \(total)" : "Reading spectrum…"
@@ -662,7 +666,7 @@ final class SpectrometerController: ObservableObject {
                 cfg.configCount = existing.configCount
             }
             let stored = Spectrum(
-                timestamp: decoded.timestamp,
+                timestamp: capturedAt,
                 points: decoded.points,
                 temperature: decoded.temperature,
                 humidity: decoded.humidity,
